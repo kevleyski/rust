@@ -1,10 +1,11 @@
-//! The pointer-sized unsigned integer type.
+//! Redundant constants module for the [`usize` primitive type][usize].
 //!
-//! *[See also the `usize` primitive type](../../std/primitive.usize.html).*
-//!
-//! Although using these constants won’t cause compilation warnings,
-//! new code should use the associated constants directly on the primitive type.
+//! New code should use the associated constants directly on the primitive type.
 
 #![stable(feature = "rust1", since = "1.0.0")]
+#![deprecated(
+    since = "TBD",
+    note = "all constants in this module replaced by associated constants on `usize`"
+)]
 
 int_module! { usize }

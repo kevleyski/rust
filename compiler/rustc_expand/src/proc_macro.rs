@@ -1,142 +1,172 @@
+use rustc_ast::ptr::P;
+use rustc_ast::tokenstream::TokenStream;
+use rustc_errors::ErrorGuaranteed;
+use rustc_parse::parser::{ForceCollect, Parser};
+use rustc_session::config::ProcMacroExecutionStrategy;
+use rustc_span::Span;
+use rustc_span::profiling::SpannedEventArgRecorder;
+use {rustc_ast as ast, rustc_proc_macro as pm};
+
 use crate::base::{self, *};
-use crate::proc_macro_server;
+use crate::{errors, proc_macro_server};
 
-use rustc_ast::token;
-use rustc_ast::tokenstream::{TokenStream, TokenTree};
-use rustc_ast::{self as ast, *};
-use rustc_data_structures::sync::Lrc;
-use rustc_errors::{struct_span_err, Applicability, ErrorReported};
-use rustc_lexer::is_ident;
-use rustc_parse::nt_to_tokenstream;
-use rustc_span::symbol::sym;
-use rustc_span::{Span, DUMMY_SP};
-
-const EXEC_STRATEGY: pm::bridge::server::SameThread = pm::bridge::server::SameThread;
-
-pub struct BangProcMacro {
-    pub client: pm::bridge::client::Client<fn(pm::TokenStream) -> pm::TokenStream>,
+struct MessagePipe<T> {
+    tx: std::sync::mpsc::SyncSender<T>,
+    rx: std::sync::mpsc::Receiver<T>,
 }
 
-impl base::ProcMacro for BangProcMacro {
-    fn expand<'cx>(
+impl<T> pm::bridge::server::MessagePipe<T> for MessagePipe<T> {
+    fn new() -> (Self, Self) {
+        let (tx1, rx1) = std::sync::mpsc::sync_channel(1);
+        let (tx2, rx2) = std::sync::mpsc::sync_channel(1);
+        (MessagePipe { tx: tx1, rx: rx2 }, MessagePipe { tx: tx2, rx: rx1 })
+    }
+
+    fn send(&mut self, value: T) {
+        self.tx.send(value).unwrap();
+    }
+
+    fn recv(&mut self) -> Option<T> {
+        self.rx.recv().ok()
+    }
+}
+
+fn exec_strategy(ecx: &ExtCtxt<'_>) -> impl pm::bridge::server::ExecutionStrategy + 'static {
+    pm::bridge::server::MaybeCrossThread::<MessagePipe<_>>::new(
+        ecx.sess.opts.unstable_opts.proc_macro_execution_strategy
+            == ProcMacroExecutionStrategy::CrossThread,
+    )
+}
+
+pub struct BangProcMacro {
+    pub client: pm::bridge::client::Client<pm::TokenStream, pm::TokenStream>,
+}
+
+impl base::BangProcMacro for BangProcMacro {
+    fn expand(
         &self,
-        ecx: &'cx mut ExtCtxt<'_>,
+        ecx: &mut ExtCtxt<'_>,
         span: Span,
         input: TokenStream,
-    ) -> Result<TokenStream, ErrorReported> {
+    ) -> Result<TokenStream, ErrorGuaranteed> {
+        let _timer =
+            ecx.sess.prof.generic_activity_with_arg_recorder("expand_proc_macro", |recorder| {
+                recorder.record_arg_with_span(ecx.sess.source_map(), ecx.expansion_descr(), span);
+            });
+
+        let proc_macro_backtrace = ecx.ecfg.proc_macro_backtrace;
+        let strategy = exec_strategy(ecx);
         let server = proc_macro_server::Rustc::new(ecx);
-        self.client.run(&EXEC_STRATEGY, server, input, ecx.ecfg.proc_macro_backtrace).map_err(|e| {
-            let mut err = ecx.struct_span_err(span, "proc macro panicked");
-            if let Some(s) = e.as_str() {
-                err.help(&format!("message: {}", s));
-            }
-            err.emit();
-            ErrorReported
+        self.client.run(&strategy, server, input, proc_macro_backtrace).map_err(|e| {
+            ecx.dcx().emit_err(errors::ProcMacroPanicked {
+                span,
+                message: e
+                    .as_str()
+                    .map(|message| errors::ProcMacroPanickedHelp { message: message.into() }),
+            })
         })
     }
 }
 
 pub struct AttrProcMacro {
-    pub client: pm::bridge::client::Client<fn(pm::TokenStream, pm::TokenStream) -> pm::TokenStream>,
+    pub client: pm::bridge::client::Client<(pm::TokenStream, pm::TokenStream), pm::TokenStream>,
 }
 
 impl base::AttrProcMacro for AttrProcMacro {
-    fn expand<'cx>(
+    fn expand(
         &self,
-        ecx: &'cx mut ExtCtxt<'_>,
+        ecx: &mut ExtCtxt<'_>,
         span: Span,
         annotation: TokenStream,
         annotated: TokenStream,
-    ) -> Result<TokenStream, ErrorReported> {
+    ) -> Result<TokenStream, ErrorGuaranteed> {
+        let _timer =
+            ecx.sess.prof.generic_activity_with_arg_recorder("expand_proc_macro", |recorder| {
+                recorder.record_arg_with_span(ecx.sess.source_map(), ecx.expansion_descr(), span);
+            });
+
+        let proc_macro_backtrace = ecx.ecfg.proc_macro_backtrace;
+        let strategy = exec_strategy(ecx);
         let server = proc_macro_server::Rustc::new(ecx);
-        self.client
-            .run(&EXEC_STRATEGY, server, annotation, annotated, ecx.ecfg.proc_macro_backtrace)
-            .map_err(|e| {
-                let mut err = ecx.struct_span_err(span, "custom attribute panicked");
-                if let Some(s) = e.as_str() {
-                    err.help(&format!("message: {}", s));
-                }
-                err.emit();
-                ErrorReported
-            })
+        self.client.run(&strategy, server, annotation, annotated, proc_macro_backtrace).map_err(
+            |e| {
+                ecx.dcx().emit_err(errors::CustomAttributePanicked {
+                    span,
+                    message: e.as_str().map(|message| errors::CustomAttributePanickedHelp {
+                        message: message.into(),
+                    }),
+                })
+            },
+        )
     }
 }
 
-pub struct ProcMacroDerive {
-    pub client: pm::bridge::client::Client<fn(pm::TokenStream) -> pm::TokenStream>,
+pub struct DeriveProcMacro {
+    pub client: pm::bridge::client::Client<pm::TokenStream, pm::TokenStream>,
 }
 
-impl MultiItemModifier for ProcMacroDerive {
+impl MultiItemModifier for DeriveProcMacro {
     fn expand(
         &self,
         ecx: &mut ExtCtxt<'_>,
         span: Span,
         _meta_item: &ast::MetaItem,
         item: Annotatable,
+        _is_derive_const: bool,
     ) -> ExpandResult<Vec<Annotatable>, Annotatable> {
-        let item = match item {
-            Annotatable::Arm(..)
-            | Annotatable::Field(..)
-            | Annotatable::FieldPat(..)
-            | Annotatable::GenericParam(..)
-            | Annotatable::Param(..)
-            | Annotatable::StructField(..)
-            | Annotatable::Variant(..) => panic!("unexpected annotatable"),
-            Annotatable::Item(item) => item,
-            Annotatable::ImplItem(_)
-            | Annotatable::TraitItem(_)
-            | Annotatable::ForeignItem(_)
-            | Annotatable::Stmt(_)
-            | Annotatable::Expr(_) => {
-                ecx.span_err(
-                    span,
-                    "proc-macro derives may only be applied to a struct, enum, or union",
-                );
-                return ExpandResult::Ready(Vec::new());
-            }
-        };
-        match item.kind {
-            ItemKind::Struct(..) | ItemKind::Enum(..) | ItemKind::Union(..) => {}
-            _ => {
-                ecx.span_err(
-                    span,
-                    "proc-macro derives may only be applied to a struct, enum, or union",
-                );
-                return ExpandResult::Ready(Vec::new());
-            }
-        }
+        // We need special handling for statement items
+        // (e.g. `fn foo() { #[derive(Debug)] struct Bar; }`)
+        let is_stmt = matches!(item, Annotatable::Stmt(..));
 
-        let item = token::NtItem(item);
-        let input = if item.pretty_printing_compatibility_hack() {
-            TokenTree::token(token::Interpolated(Lrc::new(item)), DUMMY_SP).into()
-        } else {
-            nt_to_tokenstream(&item, &ecx.sess.parse_sess, DUMMY_SP)
-        };
-
-        let server = proc_macro_server::Rustc::new(ecx);
-        let stream =
-            match self.client.run(&EXEC_STRATEGY, server, input, ecx.ecfg.proc_macro_backtrace) {
+        // We used to have an alternative behaviour for crates that needed it.
+        // We had a lint for a long time, but now we just emit a hard error.
+        // Eventually we might remove the special case hard error check
+        // altogether. See #73345.
+        crate::base::ann_pretty_printing_compatibility_hack(&item, &ecx.sess.psess);
+        let input = item.to_tokens();
+        let stream = {
+            let _timer =
+                ecx.sess.prof.generic_activity_with_arg_recorder("expand_proc_macro", |recorder| {
+                    recorder.record_arg_with_span(
+                        ecx.sess.source_map(),
+                        ecx.expansion_descr(),
+                        span,
+                    );
+                });
+            let proc_macro_backtrace = ecx.ecfg.proc_macro_backtrace;
+            let strategy = exec_strategy(ecx);
+            let server = proc_macro_server::Rustc::new(ecx);
+            match self.client.run(&strategy, server, input, proc_macro_backtrace) {
                 Ok(stream) => stream,
                 Err(e) => {
-                    let mut err = ecx.struct_span_err(span, "proc-macro derive panicked");
-                    if let Some(s) = e.as_str() {
-                        err.help(&format!("message: {}", s));
-                    }
-                    err.emit();
+                    ecx.dcx().emit_err({
+                        errors::ProcMacroDerivePanicked {
+                            span,
+                            message: e.as_str().map(|message| {
+                                errors::ProcMacroDerivePanickedHelp { message: message.into() }
+                            }),
+                        }
+                    });
                     return ExpandResult::Ready(vec![]);
                 }
-            };
+            }
+        };
 
-        let error_count_before = ecx.sess.parse_sess.span_diagnostic.err_count();
-        let mut parser =
-            rustc_parse::stream_to_parser(&ecx.sess.parse_sess, stream, Some("proc-macro derive"));
+        let error_count_before = ecx.dcx().err_count();
+        let mut parser = Parser::new(&ecx.sess.psess, stream, Some("proc-macro derive"));
         let mut items = vec![];
 
         loop {
-            match parser.parse_item() {
+            match parser.parse_item(ForceCollect::No) {
                 Ok(None) => break,
-                Ok(Some(item)) => items.push(Annotatable::Item(item)),
-                Err(mut err) => {
+                Ok(Some(item)) => {
+                    if is_stmt {
+                        items.push(Annotatable::Stmt(P(ecx.stmt_item(span, item))));
+                    } else {
+                        items.push(Annotatable::Item(item));
+                    }
+                }
+                Err(err) => {
                     err.emit();
                     break;
                 }
@@ -144,98 +174,10 @@ impl MultiItemModifier for ProcMacroDerive {
         }
 
         // fail if there have been errors emitted
-        if ecx.sess.parse_sess.span_diagnostic.err_count() > error_count_before {
-            ecx.struct_span_err(span, "proc-macro derive produced unparseable tokens").emit();
+        if ecx.dcx().err_count() > error_count_before {
+            ecx.dcx().emit_err(errors::ProcMacroDeriveTokens { span });
         }
 
         ExpandResult::Ready(items)
     }
-}
-
-crate fn collect_derives(cx: &mut ExtCtxt<'_>, attrs: &mut Vec<ast::Attribute>) -> Vec<ast::Path> {
-    let mut result = Vec::new();
-    attrs.retain(|attr| {
-        if !attr.has_name(sym::derive) {
-            return true;
-        }
-
-        // 1) First let's ensure that it's a meta item.
-        let nmis = match attr.meta_item_list() {
-            None => {
-                cx.struct_span_err(attr.span, "malformed `derive` attribute input")
-                    .span_suggestion(
-                        attr.span,
-                        "missing traits to be derived",
-                        "#[derive(Trait1, Trait2, ...)]".to_owned(),
-                        Applicability::HasPlaceholders,
-                    )
-                    .emit();
-                return false;
-            }
-            Some(x) => x,
-        };
-
-        let mut error_reported_filter_map = false;
-        let mut error_reported_map = false;
-        let traits = nmis
-            .into_iter()
-            // 2) Moreover, let's ensure we have a path and not `#[derive("foo")]`.
-            .filter_map(|nmi| match nmi {
-                NestedMetaItem::Literal(lit) => {
-                    error_reported_filter_map = true;
-                    let mut err = struct_span_err!(
-                        cx.sess,
-                        lit.span,
-                        E0777,
-                        "expected path to a trait, found literal",
-                    );
-                    let token = lit.token.to_string();
-                    if token.starts_with('"')
-                        && token.len() > 2
-                        && is_ident(&token[1..token.len() - 1])
-                    {
-                        err.help(&format!("try using `#[derive({})]`", &token[1..token.len() - 1]));
-                    } else {
-                        err.help("for example, write `#[derive(Debug)]` for `Debug`");
-                    }
-                    err.emit();
-                    None
-                }
-                NestedMetaItem::MetaItem(mi) => Some(mi),
-            })
-            // 3) Finally, we only accept `#[derive($path_0, $path_1, ..)]`
-            // but not e.g. `#[derive($path_0 = "value", $path_1(abc))]`.
-            // In this case we can still at least determine that the user
-            // wanted this trait to be derived, so let's keep it.
-            .map(|mi| {
-                let mut traits_dont_accept = |title, action| {
-                    error_reported_map = true;
-                    let sp = mi.span.with_lo(mi.path.span.hi());
-                    cx.struct_span_err(sp, title)
-                        .span_suggestion(
-                            sp,
-                            action,
-                            String::new(),
-                            Applicability::MachineApplicable,
-                        )
-                        .emit();
-                };
-                match &mi.kind {
-                    MetaItemKind::List(..) => traits_dont_accept(
-                        "traits in `#[derive(...)]` don't accept arguments",
-                        "remove the arguments",
-                    ),
-                    MetaItemKind::NameValue(..) => traits_dont_accept(
-                        "traits in `#[derive(...)]` don't accept values",
-                        "remove the value",
-                    ),
-                    MetaItemKind::Word => {}
-                }
-                mi.path
-            });
-
-        result.extend(traits);
-        !error_reported_filter_map && !error_reported_map
-    });
-    result
 }

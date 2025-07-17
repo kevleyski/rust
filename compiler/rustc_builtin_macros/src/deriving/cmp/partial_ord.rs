@@ -1,302 +1,156 @@
-pub use OrderingOp::*;
+use rustc_ast::{ExprKind, ItemKind, MetaItem, PatKind};
+use rustc_expand::base::{Annotatable, ExtCtxt};
+use rustc_span::{Ident, Span, sym};
+use thin_vec::thin_vec;
 
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
-use crate::deriving::{path_local, path_std, pathvec_std};
+use crate::deriving::{path_std, pathvec_std};
 
-use rustc_ast::ptr::P;
-use rustc_ast::{self as ast, BinOpKind, Expr, MetaItem};
-use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::{sym, Ident, Symbol};
-use rustc_span::Span;
-
-pub fn expand_deriving_partial_ord(
-    cx: &mut ExtCtxt<'_>,
+pub(crate) fn expand_deriving_partial_ord(
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
     push: &mut dyn FnMut(Annotatable),
+    is_const: bool,
 ) {
-    macro_rules! md {
-        ($name:expr, $op:expr, $equal:expr) => {{
-            let inline = cx.meta_word(span, sym::inline);
-            let attrs = vec![cx.attribute(inline)];
-            MethodDef {
-                name: $name,
-                generics: Bounds::empty(),
-                explicit_self: borrowed_explicit_self(),
-                args: vec![(borrowed_self(), sym::other)],
-                ret_ty: Literal(path_local!(bool)),
-                attributes: attrs,
-                is_unsafe: false,
-                unify_fieldless_variants: true,
-                combine_substructure: combine_substructure(Box::new(|cx, span, substr| {
-                    cs_op($op, $equal, cx, span, substr)
-                })),
-            }
-        }};
-    }
+    let ordering_ty = Path(path_std!(cmp::Ordering));
+    let ret_ty =
+        Path(Path::new_(pathvec_std!(option::Option), vec![Box::new(ordering_ty)], PathKind::Std));
 
-    let ordering_ty = Literal(path_std!(cmp::Ordering));
-    let ret_ty = Literal(Path::new_(
-        pathvec_std!(option::Option),
-        None,
-        vec![Box::new(ordering_ty)],
-        PathKind::Std,
-    ));
-
-    let inline = cx.meta_word(span, sym::inline);
-    let attrs = vec![cx.attribute(inline)];
-
+    // Order in which to perform matching
+    let discr_then_data = if let Annotatable::Item(item) = item
+        && let ItemKind::Enum(_, _, def) = &item.kind
+    {
+        let dataful: Vec<bool> = def.variants.iter().map(|v| !v.data.fields().is_empty()).collect();
+        match dataful.iter().filter(|&&b| b).count() {
+            // No data, placing the discriminant check first makes codegen simpler
+            0 => true,
+            1..=2 => false,
+            _ => (0..dataful.len() - 1).any(|i| {
+                if dataful[i]
+                    && let Some(idx) = dataful[i + 1..].iter().position(|v| *v)
+                {
+                    idx >= 2
+                } else {
+                    false
+                }
+            }),
+        }
+    } else {
+        true
+    };
     let partial_cmp_def = MethodDef {
         name: sym::partial_cmp,
         generics: Bounds::empty(),
-        explicit_self: borrowed_explicit_self(),
-        args: vec![(borrowed_self(), sym::other)],
+        explicit_self: true,
+        nonself_args: vec![(self_ref(), sym::other)],
         ret_ty,
-        attributes: attrs,
-        is_unsafe: false,
-        unify_fieldless_variants: true,
+        attributes: thin_vec![cx.attr_word(sym::inline, span)],
+        fieldless_variants_strategy: FieldlessVariantsStrategy::Unify,
         combine_substructure: combine_substructure(Box::new(|cx, span, substr| {
-            cs_partial_cmp(cx, span, substr)
+            cs_partial_cmp(cx, span, substr, discr_then_data)
         })),
-    };
-
-    // avoid defining extra methods if we can
-    // c-like enums, enums without any fields and structs without fields
-    // can safely define only `partial_cmp`.
-    let methods = if is_type_without_fields(item) {
-        vec![partial_cmp_def]
-    } else {
-        vec![
-            partial_cmp_def,
-            md!(sym::lt, true, false),
-            md!(sym::le, true, true),
-            md!(sym::gt, false, false),
-            md!(sym::ge, false, true),
-        ]
     };
 
     let trait_def = TraitDef {
         span,
-        attributes: vec![],
         path: path_std!(cmp::PartialOrd),
+        skip_path_as_bound: false,
+        needs_copy_as_bound_if_packed: true,
         additional_bounds: vec![],
-        generics: Bounds::empty(),
-        is_unsafe: false,
         supports_unions: false,
-        methods,
+        methods: vec![partial_cmp_def],
         associated_types: Vec::new(),
+        is_const,
     };
     trait_def.expand(cx, mitem, item, push)
 }
 
-#[derive(Copy, Clone)]
-pub enum OrderingOp {
-    PartialCmpOp,
-    LtOp,
-    LeOp,
-    GtOp,
-    GeOp,
-}
-
-pub fn some_ordering_collapsed(
-    cx: &mut ExtCtxt<'_>,
+fn cs_partial_cmp(
+    cx: &ExtCtxt<'_>,
     span: Span,
-    op: OrderingOp,
-    self_arg_tags: &[Ident],
-) -> P<ast::Expr> {
-    let lft = cx.expr_ident(span, self_arg_tags[0]);
-    let rgt = cx.expr_addr_of(span, cx.expr_ident(span, self_arg_tags[1]));
-    let op_sym = match op {
-        PartialCmpOp => sym::partial_cmp,
-        LtOp => sym::lt,
-        LeOp => sym::le,
-        GtOp => sym::gt,
-        GeOp => sym::ge,
-    };
-    cx.expr_method_call(span, lft, Ident::new(op_sym, span), vec![rgt])
-}
-
-pub fn cs_partial_cmp(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> P<Expr> {
+    substr: &Substructure<'_>,
+    discr_then_data: bool,
+) -> BlockOrExpr {
     let test_id = Ident::new(sym::cmp, span);
-    let ordering = cx.path_global(span, cx.std_path(&[sym::cmp, sym::Ordering, sym::Equal]));
-    let ordering_expr = cx.expr_path(ordering.clone());
-    let equals_expr = cx.expr_some(span, ordering_expr);
-
+    let equal_path = cx.path_global(span, cx.std_path(&[sym::cmp, sym::Ordering, sym::Equal]));
     let partial_cmp_path = cx.std_path(&[sym::cmp, sym::PartialOrd, sym::partial_cmp]);
 
     // Builds:
     //
-    // match ::std::cmp::PartialOrd::partial_cmp(&self_field1, &other_field1) {
-    // ::std::option::Option::Some(::std::cmp::Ordering::Equal) =>
-    // match ::std::cmp::PartialOrd::partial_cmp(&self_field2, &other_field2) {
-    // ::std::option::Option::Some(::std::cmp::Ordering::Equal) => {
-    // ...
+    // match ::core::cmp::PartialOrd::partial_cmp(&self.x, &other.x) {
+    //     ::core::option::Option::Some(::core::cmp::Ordering::Equal) =>
+    //         ::core::cmp::PartialOrd::partial_cmp(&self.y, &other.y),
+    //     cmp => cmp,
     // }
-    // cmp => cmp
-    // },
-    // cmp => cmp
-    // }
-    //
-    cs_fold(
+    let expr = cs_fold(
         // foldr nests the if-elses correctly, leaving the first field
         // as the outermost one, and the last as the innermost.
         false,
-        |cx, span, old, self_f, other_fs| {
-            // match new {
-            //     Some(::std::cmp::Ordering::Equal) => old,
-            //     cmp => cmp
-            // }
-
-            let new = {
-                let other_f = match other_fs {
-                    [o_f] => o_f,
-                    _ => cx.span_bug(span, "not exactly 2 arguments in `derive(PartialOrd)`"),
-                };
-
-                let args =
-                    vec![cx.expr_addr_of(span, self_f), cx.expr_addr_of(span, other_f.clone())];
-
-                cx.expr_call_global(span, partial_cmp_path.clone(), args)
-            };
-
-            let eq_arm = cx.arm(span, cx.pat_some(span, cx.pat_path(span, ordering.clone())), old);
-            let neq_arm = cx.arm(span, cx.pat_ident(span, test_id), cx.expr_ident(span, test_id));
-
-            cx.expr_match(span, new, vec![eq_arm, neq_arm])
-        },
-        equals_expr,
-        Box::new(|cx, span, (self_args, tag_tuple), _non_self_args| {
-            if self_args.len() != 2 {
-                cx.span_bug(span, "not exactly 2 arguments in `derive(PartialOrd)`")
-            } else {
-                some_ordering_collapsed(cx, span, PartialCmpOp, tag_tuple)
-            }
-        }),
         cx,
         span,
         substr,
-    )
-}
-
-/// Strict inequality.
-fn cs_op(
-    less: bool,
-    inclusive: bool,
-    cx: &mut ExtCtxt<'_>,
-    span: Span,
-    substr: &Substructure<'_>,
-) -> P<Expr> {
-    let ordering_path = |cx: &mut ExtCtxt<'_>, name: &str| {
-        cx.expr_path(
-            cx.path_global(span, cx.std_path(&[sym::cmp, sym::Ordering, Symbol::intern(name)])),
-        )
-    };
-
-    let par_cmp = |cx: &mut ExtCtxt<'_>, span, self_f: P<Expr>, other_fs: &[P<Expr>], default| {
-        let other_f = match other_fs {
-            [o_f] => o_f,
-            _ => cx.span_bug(span, "not exactly 2 arguments in `derive(PartialOrd)`"),
-        };
-
-        // `PartialOrd::partial_cmp(self.fi, other.fi)`
-        let cmp_path = cx.expr_path(
-            cx.path_global(span, cx.std_path(&[sym::cmp, sym::PartialOrd, sym::partial_cmp])),
-        );
-        let cmp = cx.expr_call(
-            span,
-            cmp_path,
-            vec![cx.expr_addr_of(span, self_f), cx.expr_addr_of(span, other_f.clone())],
-        );
-
-        let default = ordering_path(cx, default);
-        // `Option::unwrap_or(_, Ordering::Equal)`
-        let unwrap_path = cx.expr_path(
-            cx.path_global(span, cx.std_path(&[sym::option, sym::Option, sym::unwrap_or])),
-        );
-        cx.expr_call(span, unwrap_path, vec![cmp, default])
-    };
-
-    let fold = cs_fold1(
-        false, // need foldr
-        |cx, span, subexpr, self_f, other_fs| {
-            // build up a series of `partial_cmp`s from the inside
-            // out (hence foldr) to get lexical ordering, i.e., for op ==
-            // `ast::lt`
-            //
-            // ```
-            // Ordering::then_with(
-            //    Option::unwrap_or(
-            //        PartialOrd::partial_cmp(self.f1, other.f1), Ordering::Equal)
-            //    ),
-            //    Option::unwrap_or(
-            //        PartialOrd::partial_cmp(self.f2, other.f2), Ordering::Greater)
-            //    )
-            // )
-            // == Ordering::Less
-            // ```
-            //
-            // and for op ==
-            // `ast::le`
-            //
-            // ```
-            // Ordering::then_with(
-            //    Option::unwrap_or(
-            //        PartialOrd::partial_cmp(self.f1, other.f1), Ordering::Equal)
-            //    ),
-            //    Option::unwrap_or(
-            //        PartialOrd::partial_cmp(self.f2, other.f2), Ordering::Greater)
-            //    )
-            // )
-            // != Ordering::Greater
-            // ```
-            //
-            // The optimiser should remove the redundancy. We explicitly
-            // get use the binops to avoid auto-deref dereferencing too many
-            // layers of pointers, if the type includes pointers.
-
-            // `Option::unwrap_or(PartialOrd::partial_cmp(self.fi, other.fi), Ordering::Equal)`
-            let par_cmp = par_cmp(cx, span, self_f, other_fs, "Equal");
-
-            // `Ordering::then_with(Option::unwrap_or(..), ..)`
-            let then_with_path = cx.expr_path(
-                cx.path_global(span, cx.std_path(&[sym::cmp, sym::Ordering, sym::then_with])),
-            );
-            cx.expr_call(span, then_with_path, vec![par_cmp, cx.lambda0(span, subexpr)])
-        },
-        |cx, args| match args {
-            Some((span, self_f, other_fs)) => {
-                let opposite = if less { "Greater" } else { "Less" };
-                par_cmp(cx, span, self_f, other_fs, opposite)
-            }
-            None => cx.expr_bool(span, inclusive),
-        },
-        Box::new(|cx, span, (self_args, tag_tuple), _non_self_args| {
-            if self_args.len() != 2 {
-                cx.span_bug(span, "not exactly 2 arguments in `derive(PartialOrd)`")
-            } else {
-                let op = match (less, inclusive) {
-                    (false, false) => GtOp,
-                    (false, true) => GeOp,
-                    (true, false) => LtOp,
-                    (true, true) => LeOp,
+        |cx, fold| match fold {
+            CsFold::Single(field) => {
+                let [other_expr] = &field.other_selflike_exprs[..] else {
+                    cx.dcx().span_bug(field.span, "not exactly 2 arguments in `derive(Ord)`");
                 };
-                some_ordering_collapsed(cx, span, op, tag_tuple)
+                let args = thin_vec![field.self_expr.clone(), other_expr.clone()];
+                cx.expr_call_global(field.span, partial_cmp_path.clone(), args)
             }
-        }),
-        cx,
-        span,
-        substr,
+            CsFold::Combine(span, mut expr1, expr2) => {
+                // When the item is an enum, this expands to
+                // ```
+                // match (expr2) {
+                //     Some(Ordering::Equal) => expr1,
+                //     cmp => cmp
+                // }
+                // ```
+                // where `expr2` is `partial_cmp(self_discr, other_discr)`, and `expr1` is a `match`
+                // against the enum variants. This means that we begin by comparing the enum discriminants,
+                // before either inspecting their contents (if they match), or returning
+                // the `cmp::Ordering` of comparing the enum discriminants.
+                // ```
+                // match partial_cmp(self_discr, other_discr) {
+                //     Some(Ordering::Equal) => match (self, other)  {
+                //         (Self::A(self_0), Self::A(other_0)) => partial_cmp(self_0, other_0),
+                //         (Self::B(self_0), Self::B(other_0)) => partial_cmp(self_0, other_0),
+                //         _ => Some(Ordering::Equal)
+                //     }
+                //     cmp => cmp
+                // }
+                // ```
+                // If we have any certain enum layouts, flipping this results in better codegen
+                // ```
+                // match (self, other) {
+                //     (Self::A(self_0), Self::A(other_0)) => partial_cmp(self_0, other_0),
+                //     _ => partial_cmp(self_discr, other_discr)
+                // }
+                // ```
+                // Reference: https://github.com/rust-lang/rust/pull/103659#issuecomment-1328126354
+
+                if !discr_then_data
+                    && let ExprKind::Match(_, arms, _) = &mut expr1.kind
+                    && let Some(last) = arms.last_mut()
+                    && let PatKind::Wild = last.pat.kind
+                {
+                    last.body = Some(expr2);
+                    expr1
+                } else {
+                    let eq_arm = cx.arm(
+                        span,
+                        cx.pat_some(span, cx.pat_path(span, equal_path.clone())),
+                        expr1,
+                    );
+                    let neq_arm =
+                        cx.arm(span, cx.pat_ident(span, test_id), cx.expr_ident(span, test_id));
+                    cx.expr_match(span, expr2, thin_vec![eq_arm, neq_arm])
+                }
+            }
+            CsFold::Fieldless => cx.expr_some(span, cx.expr_path(equal_path.clone())),
+        },
     );
-
-    match *substr.fields {
-        EnumMatching(.., ref all_fields) | Struct(.., ref all_fields) if !all_fields.is_empty() => {
-            let ordering = ordering_path(cx, if less ^ inclusive { "Less" } else { "Greater" });
-            let comp_op = if inclusive { BinOpKind::Ne } else { BinOpKind::Eq };
-
-            cx.expr_binary(span, comp_op, fold, ordering)
-        }
-        _ => fold,
-    }
+    BlockOrExpr::new_expr(expr)
 }

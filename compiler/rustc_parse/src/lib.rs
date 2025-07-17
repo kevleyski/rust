@@ -1,230 +1,194 @@
 //! The main parser interface.
 
-#![feature(bool_to_option)]
-#![feature(crate_visibility_modifier)]
-#![feature(bindings_after_at)]
-#![feature(iter_order_by)]
-#![feature(or_patterns)]
+// tidy-alphabetical-start
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
+#![feature(assert_matches)]
+#![feature(box_patterns)]
+#![feature(debug_closure_helpers)]
+#![feature(if_let_guard)]
+#![feature(iter_intersperse)]
+#![recursion_limit = "256"]
+// tidy-alphabetical-end
+
+use std::path::{Path, PathBuf};
+use std::str::Utf8Error;
+use std::sync::Arc;
 
 use rustc_ast as ast;
-use rustc_ast::token::{self, DelimToken, Nonterminal, Token, TokenKind};
-use rustc_ast::tokenstream::{self, TokenStream, TokenTree};
+use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::{AttrItem, Attribute, MetaItemInner, token};
 use rustc_ast_pretty::pprust;
-use rustc_data_structures::sync::Lrc;
-use rustc_errors::{Diagnostic, FatalError, Level, PResult};
+use rustc_errors::{Diag, EmissionGuarantee, FatalError, PResult, pluralize};
 use rustc_session::parse::ParseSess;
-use rustc_span::{symbol::kw, FileName, SourceFile, Span, DUMMY_SP};
+use rustc_span::source_map::SourceMap;
+use rustc_span::{FileName, SourceFile, Span};
+pub use unicode_normalization::UNICODE_VERSION as UNICODE_NORMALIZATION_VERSION;
 
-use smallvec::SmallVec;
-use std::mem;
-use std::path::Path;
-use std::str;
-
-use tracing::{debug, info};
-
-pub const MACRO_ARGUMENTS: Option<&'static str> = Some("macro arguments");
+pub const MACRO_ARGUMENTS: Option<&str> = Some("macro arguments");
 
 #[macro_use]
 pub mod parser;
-use parser::{emit_unclosed_delims, make_unclosed_delims_error, Parser};
+use parser::Parser;
 pub mod lexer;
 pub mod validate_attr;
 
-// A bunch of utility functions of the form `parse_<thing>_from_<source>`
-// where <thing> includes crate, expr, item, stmt, tts, and one that
-// uses a HOF to parse anything, and <source> includes file and
-// `source_str`.
+mod errors;
 
-/// A variant of 'panictry!' that works on a Vec<Diagnostic> instead of a single DiagnosticBuilder.
-macro_rules! panictry_buffer {
-    ($handler:expr, $e:expr) => {{
-        use rustc_errors::FatalError;
-        use std::result::Result::{Err, Ok};
-        match $e {
-            Ok(e) => e,
-            Err(errs) => {
-                for e in errs {
-                    $handler.emit_diagnostic(&e);
-                }
-                FatalError.raise()
+rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
+
+// Unwrap the result if `Ok`, otherwise emit the diagnostics and abort.
+pub fn unwrap_or_emit_fatal<T>(expr: Result<T, Vec<Diag<'_>>>) -> T {
+    match expr {
+        Ok(expr) => expr,
+        Err(errs) => {
+            for err in errs {
+                err.emit();
             }
+            FatalError.raise()
         }
-    }};
-}
-
-pub fn parse_crate_from_file<'a>(input: &Path, sess: &'a ParseSess) -> PResult<'a, ast::Crate> {
-    let mut parser = new_parser_from_file(sess, input, None);
-    parser.parse_crate_mod()
-}
-
-pub fn parse_crate_attrs_from_file<'a>(
-    input: &Path,
-    sess: &'a ParseSess,
-) -> PResult<'a, Vec<ast::Attribute>> {
-    let mut parser = new_parser_from_file(sess, input, None);
-    parser.parse_inner_attributes()
-}
-
-pub fn parse_crate_from_source_str(
-    name: FileName,
-    source: String,
-    sess: &ParseSess,
-) -> PResult<'_, ast::Crate> {
-    new_parser_from_source_str(sess, name, source).parse_crate_mod()
-}
-
-pub fn parse_crate_attrs_from_source_str(
-    name: FileName,
-    source: String,
-    sess: &ParseSess,
-) -> PResult<'_, Vec<ast::Attribute>> {
-    new_parser_from_source_str(sess, name, source).parse_inner_attributes()
-}
-
-pub fn parse_stream_from_source_str(
-    name: FileName,
-    source: String,
-    sess: &ParseSess,
-    override_span: Option<Span>,
-) -> TokenStream {
-    let (stream, mut errors) =
-        source_file_to_stream(sess, sess.source_map().new_source_file(name, source), override_span);
-    emit_unclosed_delims(&mut errors, &sess);
-    stream
-}
-
-/// Creates a new parser from a source string.
-pub fn new_parser_from_source_str(sess: &ParseSess, name: FileName, source: String) -> Parser<'_> {
-    panictry_buffer!(&sess.span_diagnostic, maybe_new_parser_from_source_str(sess, name, source))
-}
-
-/// Creates a new parser from a source string. Returns any buffered errors from lexing the initial
-/// token stream.
-pub fn maybe_new_parser_from_source_str(
-    sess: &ParseSess,
-    name: FileName,
-    source: String,
-) -> Result<Parser<'_>, Vec<Diagnostic>> {
-    maybe_source_file_to_parser(sess, sess.source_map().new_source_file(name, source))
-}
-
-/// Creates a new parser, handling errors as appropriate if the file doesn't exist.
-/// If a span is given, that is used on an error as the source of the problem.
-pub fn new_parser_from_file<'a>(sess: &'a ParseSess, path: &Path, sp: Option<Span>) -> Parser<'a> {
-    source_file_to_parser(sess, file_to_source_file(sess, path, sp))
-}
-
-/// Given a `source_file` and config, returns a parser.
-fn source_file_to_parser(sess: &ParseSess, source_file: Lrc<SourceFile>) -> Parser<'_> {
-    panictry_buffer!(&sess.span_diagnostic, maybe_source_file_to_parser(sess, source_file))
-}
-
-/// Given a `source_file` and config, return a parser. Returns any buffered errors from lexing the
-/// initial token stream.
-fn maybe_source_file_to_parser(
-    sess: &ParseSess,
-    source_file: Lrc<SourceFile>,
-) -> Result<Parser<'_>, Vec<Diagnostic>> {
-    let end_pos = source_file.end_pos;
-    let (stream, unclosed_delims) = maybe_file_to_stream(sess, source_file, None)?;
-    let mut parser = stream_to_parser(sess, stream, None);
-    parser.unclosed_delims = unclosed_delims;
-    if parser.token == token::Eof {
-        parser.token.span = Span::new(end_pos, end_pos, parser.token.span.ctxt());
     }
+}
 
+/// Creates a new parser from a source string. On failure, the errors must be consumed via
+/// `unwrap_or_emit_fatal`, `emit`, `cancel`, etc., otherwise a panic will occur when they are
+/// dropped.
+pub fn new_parser_from_source_str(
+    psess: &ParseSess,
+    name: FileName,
+    source: String,
+) -> Result<Parser<'_>, Vec<Diag<'_>>> {
+    let source_file = psess.source_map().new_source_file(name, source);
+    new_parser_from_source_file(psess, source_file)
+}
+
+/// Creates a new parser from a filename. On failure, the errors must be consumed via
+/// `unwrap_or_emit_fatal`, `emit`, `cancel`, etc., otherwise a panic will occur when they are
+/// dropped.
+///
+/// If a span is given, that is used on an error as the source of the problem.
+pub fn new_parser_from_file<'a>(
+    psess: &'a ParseSess,
+    path: &Path,
+    sp: Option<Span>,
+) -> Result<Parser<'a>, Vec<Diag<'a>>> {
+    let sm = psess.source_map();
+    let source_file = sm.load_file(path).unwrap_or_else(|e| {
+        let msg = format!("couldn't read `{}`: {}", path.display(), e);
+        let mut err = psess.dcx().struct_fatal(msg);
+        if let Ok(contents) = std::fs::read(path)
+            && let Err(utf8err) = String::from_utf8(contents.clone())
+        {
+            utf8_error(
+                sm,
+                &path.display().to_string(),
+                sp,
+                &mut err,
+                utf8err.utf8_error(),
+                &contents,
+            );
+        }
+        if let Some(sp) = sp {
+            err.span(sp);
+        }
+        err.emit();
+    });
+    new_parser_from_source_file(psess, source_file)
+}
+
+pub fn utf8_error<E: EmissionGuarantee>(
+    sm: &SourceMap,
+    path: &str,
+    sp: Option<Span>,
+    err: &mut Diag<'_, E>,
+    utf8err: Utf8Error,
+    contents: &[u8],
+) {
+    // The file exists, but it wasn't valid UTF-8.
+    let start = utf8err.valid_up_to();
+    let note = format!("invalid utf-8 at byte `{start}`");
+    let msg = if let Some(len) = utf8err.error_len() {
+        format!(
+            "byte{s} `{bytes}` {are} not valid utf-8",
+            bytes = if len == 1 {
+                format!("{:?}", contents[start])
+            } else {
+                format!("{:?}", &contents[start..start + len])
+            },
+            s = pluralize!(len),
+            are = if len == 1 { "is" } else { "are" },
+        )
+    } else {
+        note.clone()
+    };
+    let contents = String::from_utf8_lossy(contents).to_string();
+    let source = sm.new_source_file(PathBuf::from(path).into(), contents);
+    let span = Span::with_root_ctxt(
+        source.normalized_byte_pos(start as u32),
+        source.normalized_byte_pos(start as u32),
+    );
+    if span.is_dummy() {
+        err.note(note);
+    } else {
+        if sp.is_some() {
+            err.span_note(span, msg);
+        } else {
+            err.span(span);
+            err.span_label(span, msg);
+        }
+    }
+}
+
+/// Given a session and a `source_file`, return a parser. Returns any buffered errors from lexing
+/// the initial token stream.
+fn new_parser_from_source_file(
+    psess: &ParseSess,
+    source_file: Arc<SourceFile>,
+) -> Result<Parser<'_>, Vec<Diag<'_>>> {
+    let end_pos = source_file.end_position();
+    let stream = source_file_to_stream(psess, source_file, None)?;
+    let mut parser = Parser::new(psess, stream, None);
+    if parser.token == token::Eof {
+        parser.token.span = Span::new(end_pos, end_pos, parser.token.span.ctxt(), None);
+    }
     Ok(parser)
 }
 
-// Base abstractions
-
-/// Given a session and a path and an optional span (for error reporting),
-/// add the path to the session's source_map and return the new source_file or
-/// error when a file can't be read.
-fn try_file_to_source_file(
-    sess: &ParseSess,
-    path: &Path,
-    spanopt: Option<Span>,
-) -> Result<Lrc<SourceFile>, Diagnostic> {
-    sess.source_map().load_file(path).map_err(|e| {
-        let msg = format!("couldn't read {}: {}", path.display(), e);
-        let mut diag = Diagnostic::new(Level::Fatal, &msg);
-        if let Some(sp) = spanopt {
-            diag.set_span(sp);
-        }
-        diag
-    })
-}
-
-/// Given a session and a path and an optional span (for error reporting),
-/// adds the path to the session's `source_map` and returns the new `source_file`.
-fn file_to_source_file(sess: &ParseSess, path: &Path, spanopt: Option<Span>) -> Lrc<SourceFile> {
-    match try_file_to_source_file(sess, path, spanopt) {
-        Ok(source_file) => source_file,
-        Err(d) => {
-            sess.span_diagnostic.emit_diagnostic(&d);
-            FatalError.raise();
-        }
-    }
-}
-
-/// Given a `source_file`, produces a sequence of token trees.
-pub fn source_file_to_stream(
-    sess: &ParseSess,
-    source_file: Lrc<SourceFile>,
+pub fn source_str_to_stream(
+    psess: &ParseSess,
+    name: FileName,
+    source: String,
     override_span: Option<Span>,
-) -> (TokenStream, Vec<lexer::UnmatchedBrace>) {
-    panictry_buffer!(&sess.span_diagnostic, maybe_file_to_stream(sess, source_file, override_span))
+) -> Result<TokenStream, Vec<Diag<'_>>> {
+    let source_file = psess.source_map().new_source_file(name, source);
+    source_file_to_stream(psess, source_file, override_span)
 }
 
 /// Given a source file, produces a sequence of token trees. Returns any buffered errors from
 /// parsing the token stream.
-pub fn maybe_file_to_stream(
-    sess: &ParseSess,
-    source_file: Lrc<SourceFile>,
+fn source_file_to_stream<'psess>(
+    psess: &'psess ParseSess,
+    source_file: Arc<SourceFile>,
     override_span: Option<Span>,
-) -> Result<(TokenStream, Vec<lexer::UnmatchedBrace>), Vec<Diagnostic>> {
+) -> Result<TokenStream, Vec<Diag<'psess>>> {
     let src = source_file.src.as_ref().unwrap_or_else(|| {
-        sess.span_diagnostic
-            .bug(&format!("cannot lex `source_file` without source: {}", source_file.name));
+        psess.dcx().bug(format!(
+            "cannot lex `source_file` without source: {}",
+            psess.source_map().filename_for_diagnostics(&source_file.name)
+        ));
     });
 
-    let (token_trees, unmatched_braces) =
-        lexer::parse_token_trees(sess, src.as_str(), source_file.start_pos, override_span);
-
-    match token_trees {
-        Ok(stream) => Ok((stream, unmatched_braces)),
-        Err(err) => {
-            let mut buffer = Vec::with_capacity(1);
-            err.buffer(&mut buffer);
-            // Not using `emit_unclosed_delims` to use `db.buffer`
-            for unmatched in unmatched_braces {
-                if let Some(err) = make_unclosed_delims_error(unmatched, &sess) {
-                    err.buffer(&mut buffer);
-                }
-            }
-            Err(buffer)
-        }
-    }
-}
-
-/// Given a stream and the `ParseSess`, produces a parser.
-pub fn stream_to_parser<'a>(
-    sess: &'a ParseSess,
-    stream: TokenStream,
-    subparser_name: Option<&'static str>,
-) -> Parser<'a> {
-    Parser::new(sess, stream, false, subparser_name)
+    lexer::lex_token_trees(psess, src.as_str(), source_file.start_pos, override_span)
 }
 
 /// Runs the given subparser `f` on the tokens of the given `attr`'s item.
 pub fn parse_in<'a, T>(
-    sess: &'a ParseSess,
+    psess: &'a ParseSess,
     tts: TokenStream,
     name: &'static str,
     mut f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
 ) -> PResult<'a, T> {
-    let mut parser = Parser::new(sess, tts, false, Some(name));
+    let mut parser = Parser::new(psess, tts, Some(name));
     let result = f(&mut parser)?;
     if parser.token != token::Eof {
         parser.unexpected()?;
@@ -232,432 +196,51 @@ pub fn parse_in<'a, T>(
     Ok(result)
 }
 
-// NOTE(Centril): The following probably shouldn't be here but it acknowledges the
-// fact that architecturally, we are using parsing (read on below to understand why).
-
-pub fn nt_to_tokenstream(nt: &Nonterminal, sess: &ParseSess, span: Span) -> TokenStream {
-    // A `Nonterminal` is often a parsed AST item. At this point we now
-    // need to convert the parsed AST to an actual token stream, e.g.
-    // un-parse it basically.
-    //
-    // Unfortunately there's not really a great way to do that in a
-    // guaranteed lossless fashion right now. The fallback here is to just
-    // stringify the AST node and reparse it, but this loses all span
-    // information.
-    //
-    // As a result, some AST nodes are annotated with the token stream they
-    // came from. Here we attempt to extract these lossless token streams
-    // before we fall back to the stringification.
-    let tokens = match *nt {
-        Nonterminal::NtItem(ref item) => {
-            prepend_attrs(sess, &item.attrs, item.tokens.as_ref(), span)
-        }
-        Nonterminal::NtBlock(ref block) => block.tokens.clone(),
-        Nonterminal::NtStmt(ref stmt) => {
-            // FIXME: We currently only collect tokens for `:stmt`
-            // matchers in `macro_rules!` macros. When we start collecting
-            // tokens for attributes on statements, we will need to prepend
-            // attributes here
-            stmt.tokens.clone()
-        }
-        Nonterminal::NtPat(ref pat) => pat.tokens.clone(),
-        Nonterminal::NtTy(ref ty) => ty.tokens.clone(),
-        Nonterminal::NtIdent(ident, is_raw) => {
-            Some(tokenstream::TokenTree::token(token::Ident(ident.name, is_raw), ident.span).into())
-        }
-        Nonterminal::NtLifetime(ident) => {
-            Some(tokenstream::TokenTree::token(token::Lifetime(ident.name), ident.span).into())
-        }
-        Nonterminal::NtMeta(ref attr) => attr.tokens.clone(),
-        Nonterminal::NtPath(ref path) => path.tokens.clone(),
-        Nonterminal::NtVis(ref vis) => vis.tokens.clone(),
-        Nonterminal::NtTT(ref tt) => Some(tt.clone().into()),
-        Nonterminal::NtExpr(ref expr) | Nonterminal::NtLiteral(ref expr) => {
-            if expr.tokens.is_none() {
-                debug!("missing tokens for expr {:?}", expr);
-            }
-            prepend_attrs(sess, &expr.attrs, expr.tokens.as_ref(), span)
-        }
-    };
-
-    // FIXME(#43081): Avoid this pretty-print + reparse hack
-    // Pretty-print the AST struct without inserting any parenthesis
-    // beyond those explicitly written by the user (e.g. `ExpnKind::Paren`).
-    // The resulting stream may have incorrect precedence, but it's only
-    // ever used for a comparison against the capture tokenstream.
-    let source = pprust::nonterminal_to_string_no_extra_parens(nt);
+pub fn fake_token_stream_for_item(psess: &ParseSess, item: &ast::Item) -> TokenStream {
+    let source = pprust::item_to_string(item);
     let filename = FileName::macro_expansion_source_code(&source);
-    let reparsed_tokens = parse_stream_from_source_str(filename, source, sess, Some(span));
-
-    // During early phases of the compiler the AST could get modified
-    // directly (e.g., attributes added or removed) and the internal cache
-    // of tokens my not be invalidated or updated. Consequently if the
-    // "lossless" token stream disagrees with our actual stringification
-    // (which has historically been much more battle-tested) then we go
-    // with the lossy stream anyway (losing span information).
-    //
-    // Note that the comparison isn't `==` here to avoid comparing spans,
-    // but it *also* is a "probable" equality which is a pretty weird
-    // definition. We mostly want to catch actual changes to the AST
-    // like a `#[cfg]` being processed or some weird `macro_rules!`
-    // expansion.
-    //
-    // What we *don't* want to catch is the fact that a user-defined
-    // literal like `0xf` is stringified as `15`, causing the cached token
-    // stream to not be literal `==` token-wise (ignoring spans) to the
-    // token stream we got from stringification.
-    //
-    // Instead the "probably equal" check here is "does each token
-    // recursively have the same discriminant?" We basically don't look at
-    // the token values here and assume that such fine grained token stream
-    // modifications, including adding/removing typically non-semantic
-    // tokens such as extra braces and commas, don't happen.
-    if let Some(tokens) = tokens {
-        // Compare with a non-relaxed delim match to start.
-        if tokenstream_probably_equal_for_proc_macro(&tokens, &reparsed_tokens, sess, false) {
-            return tokens;
-        }
-
-        // The check failed. This time, we pretty-print the AST struct with parenthesis
-        // inserted to preserve precedence. This may cause `None`-delimiters in the captured
-        // token stream to match up with inserted parenthesis in the reparsed stream.
-        let source_with_parens = pprust::nonterminal_to_string(nt);
-        let filename_with_parens = FileName::macro_expansion_source_code(&source_with_parens);
-        let reparsed_tokens_with_parens = parse_stream_from_source_str(
-            filename_with_parens,
-            source_with_parens,
-            sess,
-            Some(span),
-        );
-
-        // Compare with a relaxed delim match - we want inserted parenthesis in the
-        // reparsed stream to match `None`-delimiters in the original stream.
-        if tokenstream_probably_equal_for_proc_macro(
-            &tokens,
-            &reparsed_tokens_with_parens,
-            sess,
-            true,
-        ) {
-            return tokens;
-        }
-
-        info!(
-            "cached tokens found, but they're not \"probably equal\", \
-                going with stringified version"
-        );
-        info!("cached   tokens: {}", pprust::tts_to_string(&tokens));
-        info!("reparsed tokens: {}", pprust::tts_to_string(&reparsed_tokens_with_parens));
-
-        info!("cached   tokens debug: {:?}", tokens);
-        info!("reparsed tokens debug: {:?}", reparsed_tokens_with_parens);
-    }
-    reparsed_tokens
+    unwrap_or_emit_fatal(source_str_to_stream(psess, filename, source, Some(item.span)))
 }
 
-// See comments in `Nonterminal::to_tokenstream` for why we care about
-// *probably* equal here rather than actual equality
-//
-// This is otherwise the same as `eq_unspanned`, only recursing with a
-// different method.
-pub fn tokenstream_probably_equal_for_proc_macro(
-    tokens: &TokenStream,
-    reparsed_tokens: &TokenStream,
-    sess: &ParseSess,
-    relaxed_delim_match: bool,
-) -> bool {
-    // When checking for `probably_eq`, we ignore certain tokens that aren't
-    // preserved in the AST. Because they are not preserved, the pretty
-    // printer arbitrarily adds or removes them when printing as token
-    // streams, making a comparison between a token stream generated from an
-    // AST and a token stream which was parsed into an AST more reliable.
-    fn semantic_tree(tree: &TokenTree) -> bool {
-        if let TokenTree::Token(token) = tree {
-            if let
-                // The pretty printer tends to add trailing commas to
-                // everything, and in particular, after struct fields.
-                | token::Comma
-                // The pretty printer collapses many semicolons into one.
-                | token::Semi
-                // We don't preserve leading `|` tokens in patterns, so
-                // we ignore them entirely
-                | token::BinOp(token::BinOpToken::Or)
-                // We don't preserve trailing '+' tokens in trait bounds,
-                // so we ignore them entirely
-                | token::BinOp(token::BinOpToken::Plus)
-                // The pretty printer can turn `$crate` into `::crate_name`
-                | token::ModSep = token.kind {
-                return false;
-            }
-        }
-        true
-    }
+pub fn fake_token_stream_for_crate(psess: &ParseSess, krate: &ast::Crate) -> TokenStream {
+    let source = pprust::crate_to_string_for_macros(krate);
+    let filename = FileName::macro_expansion_source_code(&source);
+    unwrap_or_emit_fatal(source_str_to_stream(
+        psess,
+        filename,
+        source,
+        Some(krate.spans.inner_span),
+    ))
+}
 
-    // When comparing two `TokenStream`s, we ignore the `IsJoint` information.
-    //
-    // However, `rustc_parse::lexer::tokentrees::TokenStreamBuilder` will
-    // use `Token.glue` on adjacent tokens with the proper `IsJoint`.
-    // Since we are ignoreing `IsJoint`, a 'glued' token (e.g. `BinOp(Shr)`)
-    // and its 'split'/'unglued' compoenents (e.g. `Gt, Gt`) are equivalent
-    // when determining if two `TokenStream`s are 'probably equal'.
-    //
-    // Therefore, we use `break_two_token_op` to convert all tokens
-    // to the 'unglued' form (if it exists). This ensures that two
-    // `TokenStream`s which differ only in how their tokens are glued
-    // will be considered 'probably equal', which allows us to keep spans.
-    //
-    // This is important when the original `TokenStream` contained
-    // extra spaces (e.g. `f :: < Vec < _ > > ( ) ;'). These extra spaces
-    // will be omitted when we pretty-print, which can cause the original
-    // and reparsed `TokenStream`s to differ in the assignment of `IsJoint`,
-    // leading to some tokens being 'glued' together in one stream but not
-    // the other. See #68489 for more details.
-    fn break_tokens(tree: TokenTree) -> impl Iterator<Item = TokenTree> {
-        // In almost all cases, we should have either zero or one levels
-        // of 'unglueing'. However, in some unusual cases, we may need
-        // to iterate breaking tokens mutliple times. For example:
-        // '[BinOpEq(Shr)] => [Gt, Ge] -> [Gt, Gt, Eq]'
-        let mut token_trees: SmallVec<[_; 2]>;
-        if let TokenTree::Token(token) = &tree {
-            let mut out = SmallVec::<[_; 2]>::new();
-            out.push(token.clone());
-            // Iterate to fixpoint:
-            // * We start off with 'out' containing our initial token, and `temp` empty
-            // * If we are able to break any tokens in `out`, then `out` will have
-            //   at least one more element than 'temp', so we will try to break tokens
-            //   again.
-            // * If we cannot break any tokens in 'out', we are done
-            loop {
-                let mut temp = SmallVec::<[_; 2]>::new();
-                let mut changed = false;
+pub fn parse_cfg_attr(
+    cfg_attr: &Attribute,
+    psess: &ParseSess,
+) -> Option<(MetaItemInner, Vec<(AttrItem, Span)>)> {
+    const CFG_ATTR_GRAMMAR_HELP: &str = "#[cfg_attr(condition, attribute, other_attribute, ...)]";
+    const CFG_ATTR_NOTE_REF: &str = "for more information, visit \
+        <https://doc.rust-lang.org/reference/conditional-compilation.html#the-cfg_attr-attribute>";
 
-                for token in out.into_iter() {
-                    if let Some((first, second)) = token.kind.break_two_token_op() {
-                        temp.push(Token::new(first, DUMMY_SP));
-                        temp.push(Token::new(second, DUMMY_SP));
-                        changed = true;
-                    } else {
-                        temp.push(token);
-                    }
-                }
-                out = temp;
-                if !changed {
-                    break;
+    match cfg_attr.get_normal_item().args {
+        ast::AttrArgs::Delimited(ast::DelimArgs { dspan, delim, ref tokens })
+            if !tokens.is_empty() =>
+        {
+            crate::validate_attr::check_cfg_attr_bad_delim(psess, dspan, delim);
+            match parse_in(psess, tokens.clone(), "`cfg_attr` input", |p| p.parse_cfg_attr()) {
+                Ok(r) => return Some(r),
+                Err(e) => {
+                    e.with_help(format!("the valid syntax is `{CFG_ATTR_GRAMMAR_HELP}`"))
+                        .with_note(CFG_ATTR_NOTE_REF)
+                        .emit();
                 }
             }
-            token_trees = out.into_iter().map(TokenTree::Token).collect();
-        } else {
-            token_trees = SmallVec::new();
-            token_trees.push(tree);
         }
-        token_trees.into_iter()
-    }
-
-    fn expand_token(tree: TokenTree, sess: &ParseSess) -> impl Iterator<Item = TokenTree> {
-        // When checking tokenstreams for 'probable equality', we are comparing
-        // a captured (from parsing) `TokenStream` to a reparsed tokenstream.
-        // The reparsed Tokenstream will never have `None`-delimited groups,
-        // since they are only ever inserted as a result of macro expansion.
-        // Therefore, inserting a `None`-delimtied group here (when we
-        // convert a nested `Nonterminal` to a tokenstream) would cause
-        // a mismatch with the reparsed tokenstream.
-        //
-        // Note that we currently do not handle the case where the
-        // reparsed stream has a `Parenthesis`-delimited group
-        // inserted. This will cause a spurious mismatch:
-        // issue #75734 tracks resolving this.
-
-        let expanded: SmallVec<[_; 1]> =
-            if let TokenTree::Token(Token { kind: TokenKind::Interpolated(nt), span }) = &tree {
-                nt_to_tokenstream(nt, sess, *span)
-                    .into_trees()
-                    .flat_map(|t| expand_token(t, sess))
-                    .collect()
-            } else {
-                // Filter before and after breaking tokens,
-                // since we may want to ignore both glued and unglued tokens.
-                std::iter::once(tree)
-                    .filter(semantic_tree)
-                    .flat_map(break_tokens)
-                    .filter(semantic_tree)
-                    .collect()
-            };
-        expanded.into_iter()
-    }
-
-    // Break tokens after we expand any nonterminals, so that we break tokens
-    // that are produced as a result of nonterminal expansion.
-    let tokens = tokens.trees().flat_map(|t| expand_token(t, sess));
-    let reparsed_tokens = reparsed_tokens.trees().flat_map(|t| expand_token(t, sess));
-
-    tokens.eq_by(reparsed_tokens, |t, rt| {
-        tokentree_probably_equal_for_proc_macro(&t, &rt, sess, relaxed_delim_match)
-    })
-}
-
-// See comments in `Nonterminal::to_tokenstream` for why we care about
-// *probably* equal here rather than actual equality
-//
-// This is otherwise the same as `eq_unspanned`, only recursing with a
-// different method.
-pub fn tokentree_probably_equal_for_proc_macro(
-    token: &TokenTree,
-    reparsed_token: &TokenTree,
-    sess: &ParseSess,
-    relaxed_delim_match: bool,
-) -> bool {
-    match (token, reparsed_token) {
-        (TokenTree::Token(token), TokenTree::Token(reparsed_token)) => {
-            token_probably_equal_for_proc_macro(token, reparsed_token)
+        _ => {
+            psess.dcx().emit_err(errors::MalformedCfgAttr {
+                span: cfg_attr.span,
+                sugg: CFG_ATTR_GRAMMAR_HELP,
+            });
         }
-        (
-            TokenTree::Delimited(_, delim, tokens),
-            TokenTree::Delimited(_, reparsed_delim, reparsed_tokens),
-        ) if delim == reparsed_delim => tokenstream_probably_equal_for_proc_macro(
-            tokens,
-            reparsed_tokens,
-            sess,
-            relaxed_delim_match,
-        ),
-        (TokenTree::Delimited(_, DelimToken::NoDelim, tokens), reparsed_token) => {
-            if relaxed_delim_match {
-                if let TokenTree::Delimited(_, DelimToken::Paren, reparsed_tokens) = reparsed_token
-                {
-                    if tokenstream_probably_equal_for_proc_macro(
-                        tokens,
-                        reparsed_tokens,
-                        sess,
-                        relaxed_delim_match,
-                    ) {
-                        return true;
-                    }
-                }
-            }
-            tokens.len() == 1
-                && tokentree_probably_equal_for_proc_macro(
-                    &tokens.trees().next().unwrap(),
-                    reparsed_token,
-                    sess,
-                    relaxed_delim_match,
-                )
-        }
-        _ => false,
     }
-}
-
-// See comments in `Nonterminal::to_tokenstream` for why we care about
-// *probably* equal here rather than actual equality
-fn token_probably_equal_for_proc_macro(first: &Token, other: &Token) -> bool {
-    if mem::discriminant(&first.kind) != mem::discriminant(&other.kind) {
-        return false;
-    }
-    use rustc_ast::token::TokenKind::*;
-    match (&first.kind, &other.kind) {
-        (&Eq, &Eq)
-        | (&Lt, &Lt)
-        | (&Le, &Le)
-        | (&EqEq, &EqEq)
-        | (&Ne, &Ne)
-        | (&Ge, &Ge)
-        | (&Gt, &Gt)
-        | (&AndAnd, &AndAnd)
-        | (&OrOr, &OrOr)
-        | (&Not, &Not)
-        | (&Tilde, &Tilde)
-        | (&At, &At)
-        | (&Dot, &Dot)
-        | (&DotDot, &DotDot)
-        | (&DotDotDot, &DotDotDot)
-        | (&DotDotEq, &DotDotEq)
-        | (&Comma, &Comma)
-        | (&Semi, &Semi)
-        | (&Colon, &Colon)
-        | (&ModSep, &ModSep)
-        | (&RArrow, &RArrow)
-        | (&LArrow, &LArrow)
-        | (&FatArrow, &FatArrow)
-        | (&Pound, &Pound)
-        | (&Dollar, &Dollar)
-        | (&Question, &Question)
-        | (&Eof, &Eof) => true,
-
-        (&BinOp(a), &BinOp(b)) | (&BinOpEq(a), &BinOpEq(b)) => a == b,
-
-        (&OpenDelim(a), &OpenDelim(b)) | (&CloseDelim(a), &CloseDelim(b)) => a == b,
-
-        (&DocComment(a1, a2, a3), &DocComment(b1, b2, b3)) => a1 == b1 && a2 == b2 && a3 == b3,
-
-        (&Literal(a), &Literal(b)) => a == b,
-
-        (&Lifetime(a), &Lifetime(b)) => a == b,
-        (&Ident(a, b), &Ident(c, d)) => {
-            b == d && (a == c || a == kw::DollarCrate || c == kw::DollarCrate)
-        }
-
-        (&Interpolated(..), &Interpolated(..)) => panic!("Unexpanded Interpolated!"),
-
-        _ => panic!("forgot to add a token?"),
-    }
-}
-
-fn prepend_attrs(
-    sess: &ParseSess,
-    attrs: &[ast::Attribute],
-    tokens: Option<&tokenstream::TokenStream>,
-    span: rustc_span::Span,
-) -> Option<tokenstream::TokenStream> {
-    let tokens = tokens?;
-    if attrs.is_empty() {
-        return Some(tokens.clone());
-    }
-    let mut builder = tokenstream::TokenStreamBuilder::new();
-    for attr in attrs {
-        assert_eq!(
-            attr.style,
-            ast::AttrStyle::Outer,
-            "inner attributes should prevent cached tokens from existing"
-        );
-
-        let source = pprust::attribute_to_string(attr);
-        let macro_filename = FileName::macro_expansion_source_code(&source);
-
-        let item = match attr.kind {
-            ast::AttrKind::Normal(ref item) => item,
-            ast::AttrKind::DocComment(..) => {
-                let stream = parse_stream_from_source_str(macro_filename, source, sess, Some(span));
-                builder.push(stream);
-                continue;
-            }
-        };
-
-        // synthesize # [ $path $tokens ] manually here
-        let mut brackets = tokenstream::TokenStreamBuilder::new();
-
-        // For simple paths, push the identifier directly
-        if item.path.segments.len() == 1 && item.path.segments[0].args.is_none() {
-            let ident = item.path.segments[0].ident;
-            let token = token::Ident(ident.name, ident.as_str().starts_with("r#"));
-            brackets.push(tokenstream::TokenTree::token(token, ident.span));
-
-        // ... and for more complicated paths, fall back to a reparse hack that
-        // should eventually be removed.
-        } else {
-            let stream = parse_stream_from_source_str(macro_filename, source, sess, Some(span));
-            brackets.push(stream);
-        }
-
-        brackets.push(item.args.outer_tokens());
-
-        // The span we list here for `#` and for `[ ... ]` are both wrong in
-        // that it encompasses more than each token, but it hopefully is "good
-        // enough" for now at least.
-        builder.push(tokenstream::TokenTree::token(token::Pound, attr.span));
-        let delim_span = tokenstream::DelimSpan::from_single(attr.span);
-        builder.push(tokenstream::TokenTree::Delimited(
-            delim_span,
-            token::DelimToken::Bracket,
-            brackets.build(),
-        ));
-    }
-    builder.push(tokens.clone());
-    Some(builder.build())
+    None
 }

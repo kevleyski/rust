@@ -2,74 +2,59 @@ use std::env;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    let target = env::var("TARGET").expect("TARGET was not set");
-    if target.contains("linux") {
-        if target.contains("android") {
-            println!("cargo:rustc-link-lib=dl");
-            println!("cargo:rustc-link-lib=log");
-            println!("cargo:rustc-link-lib=gcc");
-        }
-    } else if target.contains("freebsd") {
-        println!("cargo:rustc-link-lib=execinfo");
-        println!("cargo:rustc-link-lib=pthread");
-        if env::var("RUST_STD_FREEBSD_12_ABI").is_ok() {
-            println!("cargo:rustc-cfg=freebsd12");
-        }
-    } else if target.contains("netbsd") {
-        println!("cargo:rustc-link-lib=pthread");
-        println!("cargo:rustc-link-lib=rt");
-    } else if target.contains("dragonfly") || target.contains("openbsd") {
-        println!("cargo:rustc-link-lib=pthread");
-    } else if target.contains("solaris") {
-        println!("cargo:rustc-link-lib=socket");
-        println!("cargo:rustc-link-lib=posix4");
-        println!("cargo:rustc-link-lib=pthread");
-        println!("cargo:rustc-link-lib=resolv");
-    } else if target.contains("illumos") {
-        println!("cargo:rustc-link-lib=socket");
-        println!("cargo:rustc-link-lib=posix4");
-        println!("cargo:rustc-link-lib=pthread");
-        println!("cargo:rustc-link-lib=resolv");
-        println!("cargo:rustc-link-lib=nsl");
-        // Use libumem for the (malloc-compatible) allocator
-        println!("cargo:rustc-link-lib=umem");
-    } else if target.contains("apple-darwin") {
-        println!("cargo:rustc-link-lib=System");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH was not set");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS was not set");
+    let target_vendor =
+        env::var("CARGO_CFG_TARGET_VENDOR").expect("CARGO_CFG_TARGET_VENDOR was not set");
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV was not set");
 
-        // res_init and friends require -lresolv on macOS/iOS.
-        // See #41582 and http://blog.achernya.com/2013/03/os-x-has-silly-libsystem.html
-        println!("cargo:rustc-link-lib=resolv");
-    } else if target.contains("apple-ios") {
-        println!("cargo:rustc-link-lib=System");
-        println!("cargo:rustc-link-lib=objc");
-        println!("cargo:rustc-link-lib=framework=Security");
-        println!("cargo:rustc-link-lib=framework=Foundation");
-        println!("cargo:rustc-link-lib=resolv");
-    } else if target.contains("uwp") {
-        println!("cargo:rustc-link-lib=ws2_32");
-        // For BCryptGenRandom
-        println!("cargo:rustc-link-lib=bcrypt");
-    } else if target.contains("windows") {
-        println!("cargo:rustc-link-lib=advapi32");
-        println!("cargo:rustc-link-lib=ws2_32");
-        println!("cargo:rustc-link-lib=userenv");
-    } else if target.contains("fuchsia") {
-        println!("cargo:rustc-link-lib=zircon");
-        println!("cargo:rustc-link-lib=fdio");
-    } else if target.contains("cloudabi") {
-        if cfg!(feature = "backtrace") {
-            println!("cargo:rustc-link-lib=unwind");
-        }
-        println!("cargo:rustc-link-lib=c");
-        println!("cargo:rustc-link-lib=compiler_rt");
-    } else if (target.contains("sgx") && target.contains("fortanix"))
-        || target.contains("hermit")
-        || target.contains("l4re")
-        || target.contains("redox")
-        || target.contains("haiku")
-        || target.contains("vxworks")
-        || target.contains("wasm32")
-        || target.contains("asmjs")
+    println!("cargo:rustc-check-cfg=cfg(netbsd10)");
+    if target_os == "netbsd" && env::var("RUSTC_STD_NETBSD10").is_ok() {
+        println!("cargo:rustc-cfg=netbsd10");
+    }
+
+    println!("cargo:rustc-check-cfg=cfg(restricted_std)");
+    if target_os == "linux"
+        || target_os == "android"
+        || target_os == "netbsd"
+        || target_os == "dragonfly"
+        || target_os == "openbsd"
+        || target_os == "freebsd"
+        || target_os == "solaris"
+        || target_os == "illumos"
+        || target_os == "macos"
+        || target_os == "ios"
+        || target_os == "tvos"
+        || target_os == "watchos"
+        || target_os == "visionos"
+        || target_os == "windows"
+        || target_os == "fuchsia"
+        || (target_vendor == "fortanix" && target_env == "sgx")
+        || target_os == "hermit"
+        || target_os == "trusty"
+        || target_os == "l4re"
+        || target_os == "redox"
+        || target_os == "haiku"
+        || target_os == "vxworks"
+        || target_arch == "wasm32"
+        || target_arch == "wasm64"
+        || target_os == "espidf"
+        || target_os.starts_with("solid")
+        || (target_vendor == "nintendo" && target_env == "newlib")
+        || target_os == "vita"
+        || target_os == "aix"
+        || target_os == "nto"
+        || target_os == "xous"
+        || target_os == "hurd"
+        || target_os == "uefi"
+        || target_os == "teeos"
+        || target_os == "zkvm"
+        || target_os == "rtems"
+        || target_os == "nuttx"
+        || target_os == "cygwin"
+
+        // See src/bootstrap/src/core/build_steps/synthetic_targets.rs
+        || env::var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok()
     {
         // These platforms don't have any special requirements.
     } else {
@@ -80,12 +65,13 @@ fn main() {
         // - mipsel-sony-psp
         // - nvptx64-nvidia-cuda
         // - arch=avr
-        // - tvos (aarch64-apple-tvos, x86_64-apple-tvos)
-        // - uefi (x86_64-unknown-uefi, i686-unknown-uefi)
         // - JSON targets
         // - Any new targets that have not been explicitly added above.
-        println!("cargo:rustc-cfg=feature=\"restricted-std\"");
+        println!("cargo:rustc-cfg=restricted_std");
     }
-    println!("cargo:rustc-env=STD_ENV_ARCH={}", env::var("CARGO_CFG_TARGET_ARCH").unwrap());
+
+    println!("cargo:rustc-check-cfg=cfg(backtrace_in_libstd)");
     println!("cargo:rustc-cfg=backtrace_in_libstd");
+
+    println!("cargo:rustc-env=STD_ENV_ARCH={}", env::var("CARGO_CFG_TARGET_ARCH").unwrap());
 }

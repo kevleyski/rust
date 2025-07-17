@@ -39,7 +39,7 @@
 //! ```
 //!
 //! An iterator has a method, [`next`], which when called, returns an
-//! [`Option`]`<Item>`. [`next`] will return [`Some(Item)`] as long as there
+//! <code>[Option]\<Item></code>. Calling [`next`] will return [`Some(Item)`] as long as there
 //! are elements, and once they've all been exhausted, will return `None` to
 //! indicate that iteration is finished. Individual iterators may choose to
 //! resume iteration, and so calling [`next`] again may or may not eventually
@@ -144,7 +144,7 @@
 //! let values = vec![1, 2, 3, 4, 5];
 //!
 //! for x in values {
-//!     println!("{}", x);
+//!     println!("{x}");
 //! }
 //! ```
 //!
@@ -164,7 +164,7 @@
 //! let values = vec![1, 2, 3, 4, 5];
 //!
 //! for x in values {
-//!     println!("{}", x);
+//!     println!("{x}");
 //! }
 //! ```
 //!
@@ -181,7 +181,7 @@
 //!                 None => break,
 //!             };
 //!             let x = next;
-//!             let () = { println!("{}", x); };
+//!             let () = { println!("{x}"); };
 //!         },
 //!     };
 //!     result
@@ -205,6 +205,50 @@
 //! 1. If you're writing an [`Iterator`], you can use it with a `for` loop.
 //! 2. If you're creating a collection, implementing [`IntoIterator`] for it
 //!    will allow your collection to be used with the `for` loop.
+//!
+//! # Iterating by reference
+//!
+//! Since [`into_iter()`] takes `self` by value, using a `for` loop to iterate
+//! over a collection consumes that collection. Often, you may want to iterate
+//! over a collection without consuming it. Many collections offer methods that
+//! provide iterators over references, conventionally called `iter()` and
+//! `iter_mut()` respectively:
+//!
+//! ```
+//! let mut values = vec![41];
+//! for x in values.iter_mut() {
+//!     *x += 1;
+//! }
+//! for x in values.iter() {
+//!     assert_eq!(*x, 42);
+//! }
+//! assert_eq!(values.len(), 1); // `values` is still owned by this function.
+//! ```
+//!
+//! If a collection type `C` provides `iter()`, it usually also implements
+//! `IntoIterator` for `&C`, with an implementation that just calls `iter()`.
+//! Likewise, a collection `C` that provides `iter_mut()` generally implements
+//! `IntoIterator` for `&mut C` by delegating to `iter_mut()`. This enables a
+//! convenient shorthand:
+//!
+//! ```
+//! let mut values = vec![41];
+//! for x in &mut values { // same as `values.iter_mut()`
+//!     *x += 1;
+//! }
+//! for x in &values { // same as `values.iter()`
+//!     assert_eq!(*x, 42);
+//! }
+//! assert_eq!(values.len(), 1);
+//! ```
+//!
+//! While many collections offer `iter()`, not all offer `iter_mut()`. For
+//! example, mutating the keys of a [`HashSet<T>`] could put the collection
+//! into an inconsistent state if the key hashes change, so this collection
+//! only offers `iter()`.
+//!
+//! [`into_iter()`]: IntoIterator::into_iter
+//! [`HashSet<T>`]: ../../std/collections/struct.HashSet.html
 //!
 //! # Adapters
 //!
@@ -234,8 +278,9 @@
 //!
 //! ```
 //! # #![allow(unused_must_use)]
+//! # #![allow(map_unit_fn)]
 //! let v = vec![1, 2, 3, 4, 5];
-//! v.iter().map(|x| println!("{}", x));
+//! v.iter().map(|x| println!("{x}"));
 //! ```
 //!
 //! This will not print any values, as we only created an iterator, rather than
@@ -252,10 +297,10 @@
 //! ```
 //! let v = vec![1, 2, 3, 4, 5];
 //!
-//! v.iter().for_each(|x| println!("{}", x));
+//! v.iter().for_each(|x| println!("{x}"));
 //! // or
 //! for x in &v {
-//!     println!("{}", x);
+//!     println!("{x}");
 //! }
 //! ```
 //!
@@ -284,14 +329,14 @@
 //! let five_numbers = numbers.take(5);
 //!
 //! for number in five_numbers {
-//!     println!("{}", number);
+//!     println!("{number}");
 //! }
 //! ```
 //!
 //! This will print the numbers `0` through `4`, each on their own line.
 //!
 //! Bear in mind that methods on infinite iterators, even those for which a
-//! result can be determined mathematically in finite time, may not terminate.
+//! result can be determined mathematically in finite time, might not terminate.
 //! Specifically, methods such as [`min`], which in the general case require
 //! traversing every element in the iterator, are likely not to return
 //! successfully for any infinite iterators.
@@ -300,7 +345,7 @@
 //! let ones = std::iter::repeat(1);
 //! let least = ones.min().unwrap(); // Oh no! An infinite loop!
 //! // `ones.min()` causes an infinite loop, so we won't reach this point!
-//! println!("The smallest number one is {}.", least);
+//! println!("The smallest number one is {least}.");
 //! ```
 //!
 //! [`take`]: Iterator::take
@@ -308,66 +353,114 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use self::traits::Iterator;
+// This needs to be up here in order to be usable in the child modules
+macro_rules! impl_fold_via_try_fold {
+    (fold -> try_fold) => {
+        impl_fold_via_try_fold! { @internal fold -> try_fold }
+    };
+    (rfold -> try_rfold) => {
+        impl_fold_via_try_fold! { @internal rfold -> try_rfold }
+    };
+    (spec_fold -> spec_try_fold) => {
+        impl_fold_via_try_fold! { @internal spec_fold -> spec_try_fold }
+    };
+    (spec_rfold -> spec_try_rfold) => {
+        impl_fold_via_try_fold! { @internal spec_rfold -> spec_try_rfold }
+    };
+    (@internal $fold:ident -> $try_fold:ident) => {
+        #[inline]
+        fn $fold<AAA, FFF>(mut self, init: AAA, fold: FFF) -> AAA
+        where
+            FFF: FnMut(AAA, Self::Item) -> AAA,
+        {
+            use crate::ops::NeverShortCircuit;
 
-#[unstable(
-    feature = "step_trait",
-    reason = "likely to be replaced by finer-grained traits",
-    issue = "42168"
-)]
-pub use self::range::Step;
+            self.$try_fold(init, NeverShortCircuit::wrap_mut_2(fold)).0
+        }
+    };
+}
 
-#[stable(feature = "iter_empty", since = "1.2.0")]
-pub use self::sources::{empty, Empty};
-#[stable(feature = "iter_from_fn", since = "1.34.0")]
-pub use self::sources::{from_fn, FromFn};
-#[stable(feature = "iter_once", since = "1.2.0")]
-pub use self::sources::{once, Once};
-#[stable(feature = "iter_once_with", since = "1.43.0")]
-pub use self::sources::{once_with, OnceWith};
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use self::sources::{repeat, Repeat};
-#[stable(feature = "iterator_repeat_with", since = "1.28.0")]
-pub use self::sources::{repeat_with, RepeatWith};
-#[stable(feature = "iter_successors", since = "1.34.0")]
-pub use self::sources::{successors, Successors};
-
-#[stable(feature = "fused", since = "1.26.0")]
-pub use self::traits::FusedIterator;
-#[unstable(feature = "trusted_len", issue = "37572")]
-pub use self::traits::TrustedLen;
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use self::traits::{DoubleEndedIterator, Extend, FromIterator, IntoIterator};
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use self::traits::{ExactSizeIterator, Product, Sum};
-
-#[unstable(issue = "none", feature = "inplace_iteration")]
-pub use self::traits::InPlaceIterable;
-
+#[unstable(feature = "iter_array_chunks", reason = "recently added", issue = "100450")]
+pub use self::adapters::ArrayChunks;
+#[unstable(feature = "std_internals", issue = "none")]
+pub use self::adapters::ByRefSized;
 #[stable(feature = "iter_cloned", since = "1.1.0")]
 pub use self::adapters::Cloned;
 #[stable(feature = "iter_copied", since = "1.36.0")]
 pub use self::adapters::Copied;
 #[stable(feature = "iterator_flatten", since = "1.29.0")]
 pub use self::adapters::Flatten;
-
-#[unstable(feature = "iter_map_while", reason = "recently added", issue = "68537")]
+#[stable(feature = "iter_map_while", since = "1.57.0")]
 pub use self::adapters::MapWhile;
-#[unstable(issue = "none", feature = "inplace_iteration")]
+#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+pub use self::adapters::MapWindows;
+#[unstable(feature = "inplace_iteration", issue = "none")]
 pub use self::adapters::SourceIter;
 #[stable(feature = "iterator_step_by", since = "1.28.0")]
 pub use self::adapters::StepBy;
 #[unstable(feature = "trusted_random_access", issue = "none")]
 pub use self::adapters::TrustedRandomAccess;
+#[unstable(feature = "trusted_random_access", issue = "none")]
+pub use self::adapters::TrustedRandomAccessNoCoerce;
+#[unstable(feature = "iter_chain", reason = "recently added", issue = "125964")]
+pub use self::adapters::chain;
+pub(crate) use self::adapters::try_process;
+#[stable(feature = "iter_zip", since = "1.59.0")]
+pub use self::adapters::zip;
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use self::adapters::{Chain, Cycle, Enumerate, Filter, FilterMap, Map, Rev, Zip};
+pub use self::adapters::{
+    Chain, Cycle, Enumerate, Filter, FilterMap, FlatMap, Fuse, Inspect, Map, Peekable, Rev, Scan,
+    Skip, SkipWhile, Take, TakeWhile, Zip,
+};
+#[unstable(feature = "iter_intersperse", reason = "recently added", issue = "79524")]
+pub use self::adapters::{Intersperse, IntersperseWith};
+#[unstable(
+    feature = "step_trait",
+    reason = "likely to be replaced by finer-grained traits",
+    issue = "42168"
+)]
+pub use self::range::Step;
+#[unstable(feature = "iter_macro", issue = "142269", reason = "generators are unstable")]
+pub use self::sources::iter;
+#[stable(feature = "iter_empty", since = "1.2.0")]
+pub use self::sources::{Empty, empty};
+#[unstable(
+    feature = "iter_from_coroutine",
+    issue = "43122",
+    reason = "coroutines are unstable"
+)]
+pub use self::sources::{FromCoroutine, from_coroutine};
+#[stable(feature = "iter_from_fn", since = "1.34.0")]
+pub use self::sources::{FromFn, from_fn};
+#[stable(feature = "iter_once", since = "1.2.0")]
+pub use self::sources::{Once, once};
+#[stable(feature = "iter_once_with", since = "1.43.0")]
+pub use self::sources::{OnceWith, once_with};
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use self::adapters::{FlatMap, Peekable, Scan, Skip, SkipWhile, Take, TakeWhile};
+pub use self::sources::{Repeat, repeat};
+#[stable(feature = "iter_repeat_n", since = "1.82.0")]
+pub use self::sources::{RepeatN, repeat_n};
+#[stable(feature = "iterator_repeat_with", since = "1.28.0")]
+pub use self::sources::{RepeatWith, repeat_with};
+#[stable(feature = "iter_successors", since = "1.34.0")]
+pub use self::sources::{Successors, successors};
+#[stable(feature = "fused", since = "1.26.0")]
+pub use self::traits::FusedIterator;
+#[unstable(issue = "none", feature = "inplace_iteration")]
+pub use self::traits::InPlaceIterable;
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use self::adapters::{Fuse, Inspect};
-
-pub(crate) use self::adapters::process_results;
+pub use self::traits::Iterator;
+#[unstable(issue = "none", feature = "trusted_fused")]
+pub use self::traits::TrustedFused;
+#[unstable(feature = "trusted_len", issue = "37572")]
+pub use self::traits::TrustedLen;
+#[unstable(feature = "trusted_step", issue = "85731")]
+pub use self::traits::TrustedStep;
+pub(crate) use self::traits::UncheckedIterator;
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use self::traits::{
+    DoubleEndedIterator, ExactSizeIterator, Extend, FromIterator, IntoIterator, Product, Sum,
+};
 
 mod adapters;
 mod range;

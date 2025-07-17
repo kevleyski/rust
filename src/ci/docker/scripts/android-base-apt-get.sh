@@ -1,3 +1,4 @@
+#!/bin/sh
 set -ex
 
 apt-get update
@@ -9,6 +10,7 @@ apt-get install -y --no-install-recommends \
   g++ \
   git \
   libssl-dev \
+  libncurses-dev \
   make \
   ninja-build \
   pkg-config \

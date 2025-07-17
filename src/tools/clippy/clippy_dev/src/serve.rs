@@ -1,19 +1,35 @@
-use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
-use std::thread;
 use std::time::{Duration, SystemTime};
+use std::{env, thread};
 
-pub fn run(port: u16, lint: Option<&str>) -> ! {
+#[cfg(windows)]
+const PYTHON: &str = "python";
+
+#[cfg(not(windows))]
+const PYTHON: &str = "python3";
+
+/// # Panics
+///
+/// Panics if the python commands could not be spawned
+pub fn run(port: u16, lint: Option<String>) -> ! {
     let mut url = Some(match lint {
-        None => format!("http://localhost:{}", port),
-        Some(lint) => format!("http://localhost:{}/#{}", port, lint),
+        None => format!("http://localhost:{port}"),
+        Some(lint) => format!("http://localhost:{port}/#{lint}"),
     });
 
     loop {
-        if mtime("util/gh-pages/lints.json") < mtime("clippy_lints/src") {
-            Command::new("python3")
-                .arg("util/export.py")
+        let index_time = mtime("util/gh-pages/index.html");
+        let times = [
+            "clippy_lints/src",
+            "util/gh-pages/index_template.html",
+            "tests/compile-test.rs",
+        ]
+        .map(mtime);
+
+        if times.iter().any(|&time| index_time < time) {
+            Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                .arg("collect-metadata")
                 .spawn()
                 .unwrap()
                 .wait()
@@ -21,7 +37,7 @@ pub fn run(port: u16, lint: Option<&str>) -> ! {
         }
         if let Some(url) = url.take() {
             thread::spawn(move || {
-                Command::new("python3")
+                let mut child = Command::new(PYTHON)
                     .arg("-m")
                     .arg("http.server")
                     .arg(port.to_string())
@@ -31,7 +47,8 @@ pub fn run(port: u16, lint: Option<&str>) -> ! {
                 // Give some time for python to start
                 thread::sleep(Duration::from_millis(500));
                 // Launch browser after first export.py has completed and http.server is up
-                let _ = opener::open(url);
+                let _result = opener::open(url);
+                child.wait().unwrap();
             });
         }
         thread::sleep(Duration::from_millis(1000));
@@ -45,20 +62,12 @@ fn mtime(path: impl AsRef<Path>) -> SystemTime {
             .into_iter()
             .flatten()
             .flatten()
-            .map(|entry| mtime(&entry.path()))
+            .map(|entry| mtime(entry.path()))
             .max()
             .unwrap_or(SystemTime::UNIX_EPOCH)
     } else {
         path.metadata()
             .and_then(|metadata| metadata.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH)
-    }
-}
-
-#[allow(clippy::missing_errors_doc)]
-pub fn validate_port(arg: &OsStr) -> Result<(), OsString> {
-    match arg.to_string_lossy().parse::<u16>() {
-        Ok(_port) => Ok(()),
-        Err(err) => Err(OsString::from(err.to_string())),
     }
 }

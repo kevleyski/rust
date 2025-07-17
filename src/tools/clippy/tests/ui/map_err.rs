@@ -1,5 +1,5 @@
 #![warn(clippy::map_err_ignore)]
-use std::convert::TryFrom;
+#![allow(clippy::unnecessary_wraps)]
 use std::error::Error;
 use std::fmt;
 
@@ -20,6 +20,11 @@ fn main() -> Result<(), Errors> {
     let x = u32::try_from(-123_i32);
 
     println!("{:?}", x.map_err(|_| Errors::Ignored));
+    //~^ map_err_ignore
+
+    // Should not warn you because you explicitly ignore the parameter
+    // using a named wildcard value
+    println!("{:?}", x.map_err(|_foo| Errors::Ignored));
 
     Ok(())
 }

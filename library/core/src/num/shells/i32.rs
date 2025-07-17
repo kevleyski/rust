@@ -1,10 +1,11 @@
-//! The 32-bit signed integer type.
+//! Redundant constants module for the [`i32` primitive type][i32].
 //!
-//! *[See also the `i32` primitive type](../../std/primitive.i32.html).*
-//!
-//! Although using these constants won’t cause compilation warnings,
-//! new code should use the associated constants directly on the primitive type.
+//! New code should use the associated constants directly on the primitive type.
 
 #![stable(feature = "rust1", since = "1.0.0")]
+#![deprecated(
+    since = "TBD",
+    note = "all constants in this module replaced by associated constants on `i32`"
+)]
 
 int_module! { i32 }

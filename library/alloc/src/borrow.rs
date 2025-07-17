@@ -2,23 +2,24 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use core::cmp::Ordering;
-use core::hash::{Hash, Hasher};
-use core::ops::{Add, AddAssign, Deref};
-
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::borrow::{Borrow, BorrowMut};
-
-use crate::fmt;
-use crate::string::String;
+use core::cmp::Ordering;
+use core::hash::{Hash, Hasher};
+#[cfg(not(no_global_oom_handling))]
+use core::ops::{Add, AddAssign};
+use core::ops::{Deref, DerefPure};
 
 use Cow::*;
+
+use crate::fmt;
+#[cfg(not(no_global_oom_handling))]
+use crate::string::String;
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, B: ?Sized> Borrow<B> for Cow<'a, B>
 where
     B: ToOwned,
-    <B as ToOwned>::Owned: 'a,
 {
     fn borrow(&self) -> &B {
         &**self
@@ -31,6 +32,7 @@ where
 /// implementing the `Clone` trait. But `Clone` works only for going from `&T`
 /// to `T`. The `ToOwned` trait generalizes `Clone` to construct owned data
 /// from any borrow of a given type.
+#[rustc_diagnostic_item = "ToOwned"]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait ToOwned {
     /// The resulting type after obtaining ownership.
@@ -52,25 +54,25 @@ pub trait ToOwned {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[must_use = "cloning is often expensive and is not expected to have side effects"]
+    #[rustc_diagnostic_item = "to_owned_method"]
     fn to_owned(&self) -> Self::Owned;
 
     /// Uses borrowed data to replace owned data, usually by cloning.
     ///
-    /// This is borrow-generalized version of `Clone::clone_from`.
+    /// This is borrow-generalized version of [`Clone::clone_from`].
     ///
     /// # Examples
     ///
     /// Basic usage:
     ///
     /// ```
-    /// # #![feature(toowned_clone_into)]
     /// let mut s: String = String::new();
     /// "hello".clone_into(&mut s);
     ///
     /// let mut v: Vec<i32> = Vec::new();
     /// [1, 2][..].clone_into(&mut v);
     /// ```
-    #[unstable(feature = "toowned_clone_into", reason = "recently added", issue = "41263")]
+    #[stable(feature = "toowned_clone_into", since = "1.63.0")]
     fn clone_into(&self, target: &mut Self::Owned) {
         *target = self.to_owned();
     }
@@ -103,12 +105,17 @@ where
 /// is desired, `to_mut` will obtain a mutable reference to an owned
 /// value, cloning if necessary.
 ///
+/// If you need reference-counting pointers, note that
+/// [`Rc::make_mut`][crate::rc::Rc::make_mut] and
+/// [`Arc::make_mut`][crate::sync::Arc::make_mut] can provide clone-on-write
+/// functionality as well.
+///
 /// # Examples
 ///
 /// ```
 /// use std::borrow::Cow;
 ///
-/// fn abs_all(input: &mut Cow<[i32]>) {
+/// fn abs_all(input: &mut Cow<'_, [i32]>) {
 ///     for i in 0..input.len() {
 ///         let v = input[i];
 ///         if v < 0 {
@@ -138,7 +145,7 @@ where
 /// ```
 /// use std::borrow::Cow;
 ///
-/// struct Items<'a, X: 'a> where [X]: ToOwned<Owned = Vec<X>> {
+/// struct Items<'a, X> where [X]: ToOwned<Owned = Vec<X>> {
 ///     values: Cow<'a, [X]>,
 /// }
 ///
@@ -152,7 +159,7 @@ where
 /// let readonly = [1, 2];
 /// let borrowed = Items::new((&readonly[..]).into());
 /// match borrowed {
-///     Items { values: Cow::Borrowed(b) } => println!("borrowed {:?}", b),
+///     Items { values: Cow::Borrowed(b) } => println!("borrowed {b:?}"),
 ///     _ => panic!("expect borrowed value"),
 /// }
 ///
@@ -161,13 +168,14 @@ where
 /// clone_on_write.values.to_mut().push(3);
 /// println!("clone_on_write = {:?}", clone_on_write.values);
 ///
-/// // The data was mutated. Let check it out.
+/// // The data was mutated. Let's check it out.
 /// match clone_on_write {
 ///     Items { values: Cow::Owned(_) } => println!("clone_on_write contains owned data"),
 ///     _ => panic!("expect owned data"),
 /// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "Cow"]
 pub enum Cow<'a, B: ?Sized + 'a>
 where
     B: ToOwned,
@@ -217,7 +225,6 @@ impl<B: ?Sized + ToOwned> Cow<'_, B> {
     /// assert!(!bull.is_borrowed());
     /// ```
     #[unstable(feature = "cow_is_borrowed", issue = "65143")]
-    #[rustc_const_unstable(feature = "const_cow_is_borrowed", issue = "65143")]
     pub const fn is_borrowed(&self) -> bool {
         match *self {
             Borrowed(_) => true,
@@ -240,7 +247,6 @@ impl<B: ?Sized + ToOwned> Cow<'_, B> {
     /// assert!(!bull.is_owned());
     /// ```
     #[unstable(feature = "cow_is_borrowed", issue = "65143")]
-    #[rustc_const_unstable(feature = "const_cow_is_borrowed", issue = "65143")]
     pub const fn is_owned(&self) -> bool {
         !self.is_borrowed()
     }
@@ -259,7 +265,7 @@ impl<B: ?Sized + ToOwned> Cow<'_, B> {
     ///
     /// assert_eq!(
     ///   cow,
-    ///   Cow::Owned(String::from("FOO")) as Cow<str>
+    ///   Cow::Owned(String::from("FOO")) as Cow<'_, str>
     /// );
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -282,8 +288,7 @@ impl<B: ?Sized + ToOwned> Cow<'_, B> {
     ///
     /// # Examples
     ///
-    /// Calling `into_owned` on a `Cow::Borrowed` clones the underlying data
-    /// and becomes a `Cow::Owned`:
+    /// Calling `into_owned` on a `Cow::Borrowed` returns a clone of the borrowed data:
     ///
     /// ```
     /// use std::borrow::Cow;
@@ -297,13 +302,14 @@ impl<B: ?Sized + ToOwned> Cow<'_, B> {
     /// );
     /// ```
     ///
-    /// Calling `into_owned` on a `Cow::Owned` is a no-op:
+    /// Calling `into_owned` on a `Cow::Owned` returns the owned data. The data is moved out of the
+    /// `Cow` without being cloned.
     ///
     /// ```
     /// use std::borrow::Cow;
     ///
     /// let s = "Hello world!";
-    /// let cow: Cow<str> = Cow::Owned(String::from(s));
+    /// let cow: Cow<'_, str> = Cow::Owned(String::from(s));
     ///
     /// assert_eq!(
     ///   cow.into_owned(),
@@ -320,7 +326,10 @@ impl<B: ?Sized + ToOwned> Cow<'_, B> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<B: ?Sized + ToOwned> Deref for Cow<'_, B> {
+impl<B: ?Sized + ToOwned> Deref for Cow<'_, B>
+where
+    B::Owned: Borrow<B>,
+{
     type Target = B;
 
     fn deref(&self) -> &B {
@@ -330,6 +339,19 @@ impl<B: ?Sized + ToOwned> Deref for Cow<'_, B> {
         }
     }
 }
+
+// `Cow<'_, T>` can only implement `DerefPure` if `<T::Owned as Borrow<T>>` (and `BorrowMut<T>`) is trusted.
+// For now, we restrict `DerefPure for Cow<T>` to `T: Sized` (`T as Borrow<T>` is trusted),
+// `str` (`String as Borrow<str>` is trusted) and `[T]` (`Vec<T> as Borrow<[T]>` is trusted).
+// In the future, a `BorrowPure<T>` trait analogous to `DerefPure` might generalize this.
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl<T: Clone> DerefPure for Cow<'_, T> {}
+#[cfg(not(no_global_oom_handling))]
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl DerefPure for Cow<'_, str> {}
+#[cfg(not(no_global_oom_handling))]
+#[unstable(feature = "deref_pure_trait", issue = "87121")]
+unsafe impl<T: Clone> DerefPure for Cow<'_, [T]> {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<B: ?Sized> Eq for Cow<'_, B> where B: Eq + ToOwned {}
@@ -423,6 +445,7 @@ impl<T: ?Sized + ToOwned> AsRef<T> for Cow<'_, T> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_add", since = "1.14.0")]
 impl<'a> Add<&'a str> for Cow<'a, str> {
     type Output = Cow<'a, str>;
@@ -434,6 +457,7 @@ impl<'a> Add<&'a str> for Cow<'a, str> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_add", since = "1.14.0")]
 impl<'a> Add<Cow<'a, str>> for Cow<'a, str> {
     type Output = Cow<'a, str>;
@@ -445,6 +469,7 @@ impl<'a> Add<Cow<'a, str>> for Cow<'a, str> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_add", since = "1.14.0")]
 impl<'a> AddAssign<&'a str> for Cow<'a, str> {
     fn add_assign(&mut self, rhs: &'a str) {
@@ -461,6 +486,7 @@ impl<'a> AddAssign<&'a str> for Cow<'a, str> {
     }
 }
 
+#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "cow_add", since = "1.14.0")]
 impl<'a> AddAssign<Cow<'a, str>> for Cow<'a, str> {
     fn add_assign(&mut self, rhs: Cow<'a, str>) {

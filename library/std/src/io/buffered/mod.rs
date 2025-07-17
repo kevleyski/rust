@@ -8,14 +8,14 @@ mod linewritershim;
 #[cfg(test)]
 mod tests;
 
-use crate::error;
-use crate::fmt;
-use crate::io::Error;
-
-pub use bufreader::BufReader;
-pub use bufwriter::BufWriter;
-pub use linewriter::LineWriter;
+#[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
+pub use bufwriter::WriterPanicked;
 use linewritershim::LineWriterShim;
+
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use self::{bufreader::BufReader, bufwriter::BufWriter, linewriter::LineWriter};
+use crate::io::Error;
+use crate::{error, fmt};
 
 /// An error returned by [`BufWriter::into_inner`] which combines an error that
 /// happened while writing out the buffer, and the buffered writer object
@@ -46,7 +46,7 @@ use linewritershim::LineWriterShim;
 pub struct IntoInnerError<W>(W, Error);
 
 impl<W> IntoInnerError<W> {
-    /// Construct a new IntoInnerError
+    /// Constructs a new IntoInnerError
     fn new(writer: W, error: Error) -> Self {
         Self(writer, error)
     }
@@ -125,6 +125,49 @@ impl<W> IntoInnerError<W> {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn into_inner(self) -> W {
         self.0
+    }
+
+    /// Consumes the [`IntoInnerError`] and returns the error which caused the call to
+    /// [`BufWriter::into_inner()`] to fail.  Unlike `error`, this can be used to
+    /// obtain ownership of the underlying error.
+    ///
+    /// # Example
+    /// ```
+    /// use std::io::{BufWriter, ErrorKind, Write};
+    ///
+    /// let mut not_enough_space = [0u8; 10];
+    /// let mut stream = BufWriter::new(not_enough_space.as_mut());
+    /// write!(stream, "this cannot be actually written").unwrap();
+    /// let into_inner_err = stream.into_inner().expect_err("now we discover it's too small");
+    /// let err = into_inner_err.into_error();
+    /// assert_eq!(err.kind(), ErrorKind::WriteZero);
+    /// ```
+    #[stable(feature = "io_into_inner_error_parts", since = "1.55.0")]
+    pub fn into_error(self) -> Error {
+        self.1
+    }
+
+    /// Consumes the [`IntoInnerError`] and returns the error which caused the call to
+    /// [`BufWriter::into_inner()`] to fail, and the underlying writer.
+    ///
+    /// This can be used to simply obtain ownership of the underlying error; it can also be used for
+    /// advanced error recovery.
+    ///
+    /// # Example
+    /// ```
+    /// use std::io::{BufWriter, ErrorKind, Write};
+    ///
+    /// let mut not_enough_space = [0u8; 10];
+    /// let mut stream = BufWriter::new(not_enough_space.as_mut());
+    /// write!(stream, "this cannot be actually written").unwrap();
+    /// let into_inner_err = stream.into_inner().expect_err("now we discover it's too small");
+    /// let (err, recovered_writer) = into_inner_err.into_parts();
+    /// assert_eq!(err.kind(), ErrorKind::WriteZero);
+    /// assert_eq!(recovered_writer.buffer(), b"t be actually written");
+    /// ```
+    #[stable(feature = "io_into_inner_error_parts", since = "1.55.0")]
+    pub fn into_parts(self) -> (Error, W) {
+        (self.1, self.0)
     }
 }
 

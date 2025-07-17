@@ -1,10 +1,11 @@
-//! The 128-bit signed integer type.
+//! Redundant constants module for the [`i128` primitive type][i128].
 //!
-//! *[See also the `i128` primitive type](../../std/primitive.i128.html).*
-//!
-//! Although using these constants won’t cause compilation warnings,
-//! new code should use the associated constants directly on the primitive type.
+//! New code should use the associated constants directly on the primitive type.
 
 #![stable(feature = "i128", since = "1.26.0")]
+#![deprecated(
+    since = "TBD",
+    note = "all constants in this module replaced by associated constants on `i128`"
+)]
 
 int_module! { i128, #[stable(feature = "i128", since="1.26.0")] }

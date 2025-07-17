@@ -1,17 +1,17 @@
 //! Module `time` contains everything related to the time measurement of unit tests
 //! execution.
-//! Two main purposes of this module:
+//! The purposes of this module:
 //! - Check whether test is timed out.
 //! - Provide helpers for `report-time` and `measure-time` options.
+//! - Provide newtypes for executions times.
 
-use std::env;
-use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+use std::{env, fmt};
 
 use super::types::{TestDesc, TestType};
 
-pub const TEST_WARN_TIMEOUT_S: u64 = 60;
+pub(crate) const TEST_WARN_TIMEOUT_S: u64 = 60;
 
 /// This small module contains constants used by `report-time` option.
 /// Those constants values will be used if corresponding environment variables are not set.
@@ -22,51 +22,62 @@ pub const TEST_WARN_TIMEOUT_S: u64 = 60;
 ///
 /// Example of the expected format is `RUST_TEST_TIME_xxx=100,200`, where 100 means
 /// warn time, and 200 means critical time.
-pub mod time_constants {
-    use super::TEST_WARN_TIMEOUT_S;
+pub(crate) mod time_constants {
     use std::time::Duration;
 
+    use super::TEST_WARN_TIMEOUT_S;
+
     /// Environment variable for overriding default threshold for unit-tests.
-    pub const UNIT_ENV_NAME: &str = "RUST_TEST_TIME_UNIT";
+    pub(crate) const UNIT_ENV_NAME: &str = "RUST_TEST_TIME_UNIT";
 
     // Unit tests are supposed to be really quick.
-    pub const UNIT_WARN: Duration = Duration::from_millis(50);
-    pub const UNIT_CRITICAL: Duration = Duration::from_millis(100);
+    pub(crate) const UNIT_WARN: Duration = Duration::from_millis(50);
+    pub(crate) const UNIT_CRITICAL: Duration = Duration::from_millis(100);
 
     /// Environment variable for overriding default threshold for unit-tests.
-    pub const INTEGRATION_ENV_NAME: &str = "RUST_TEST_TIME_INTEGRATION";
+    pub(crate) const INTEGRATION_ENV_NAME: &str = "RUST_TEST_TIME_INTEGRATION";
 
     // Integration tests may have a lot of work, so they can take longer to execute.
-    pub const INTEGRATION_WARN: Duration = Duration::from_millis(500);
-    pub const INTEGRATION_CRITICAL: Duration = Duration::from_millis(1000);
+    pub(crate) const INTEGRATION_WARN: Duration = Duration::from_millis(500);
+    pub(crate) const INTEGRATION_CRITICAL: Duration = Duration::from_millis(1000);
 
     /// Environment variable for overriding default threshold for unit-tests.
-    pub const DOCTEST_ENV_NAME: &str = "RUST_TEST_TIME_DOCTEST";
+    pub(crate) const DOCTEST_ENV_NAME: &str = "RUST_TEST_TIME_DOCTEST";
 
     // Doctests are similar to integration tests, because they can include a lot of
     // initialization code.
-    pub const DOCTEST_WARN: Duration = INTEGRATION_WARN;
-    pub const DOCTEST_CRITICAL: Duration = INTEGRATION_CRITICAL;
+    pub(crate) const DOCTEST_WARN: Duration = INTEGRATION_WARN;
+    pub(crate) const DOCTEST_CRITICAL: Duration = INTEGRATION_CRITICAL;
 
     // Do not suppose anything about unknown tests, base limits on the
     // `TEST_WARN_TIMEOUT_S` constant.
-    pub const UNKNOWN_WARN: Duration = Duration::from_secs(TEST_WARN_TIMEOUT_S);
-    pub const UNKNOWN_CRITICAL: Duration = Duration::from_secs(TEST_WARN_TIMEOUT_S * 2);
+    pub(crate) const UNKNOWN_WARN: Duration = Duration::from_secs(TEST_WARN_TIMEOUT_S);
+    pub(crate) const UNKNOWN_CRITICAL: Duration = Duration::from_secs(TEST_WARN_TIMEOUT_S * 2);
 }
 
 /// Returns an `Instance` object denoting when the test should be considered
 /// timed out.
-pub fn get_default_test_timeout() -> Instant {
+pub(crate) fn get_default_test_timeout() -> Instant {
     Instant::now() + Duration::from_secs(TEST_WARN_TIMEOUT_S)
 }
 
-/// The meassured execution time of a unit test.
+/// The measured execution time of a unit test.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestExecTime(pub Duration);
 
 impl fmt::Display for TestExecTime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:.3}s", self.0.as_secs_f64())
+    }
+}
+
+/// The measured execution time of the whole test suite.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TestSuiteExecTime(pub Duration);
+
+impl fmt::Display for TestSuiteExecTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.2}s", self.0.as_secs_f64())
     }
 }
 
@@ -94,30 +105,22 @@ impl TimeThreshold {
     /// value.
     pub fn from_env_var(env_var_name: &str) -> Option<Self> {
         let durations_str = env::var(env_var_name).ok()?;
-
-        // Split string into 2 substrings by comma and try to parse numbers.
-        let mut durations = durations_str.splitn(2, ',').map(|v| {
-            u64::from_str(v).unwrap_or_else(|_| {
-                panic!(
-                    "Duration value in variable {} is expected to be a number, but got {}",
-                    env_var_name, v
-                )
-            })
+        let (warn_str, critical_str) = durations_str.split_once(',').unwrap_or_else(|| {
+            panic!(
+                "Duration variable {env_var_name} expected to have 2 numbers separated by comma, but got {durations_str}"
+            )
         });
 
-        // Callback to be called if the environment variable has unexpected structure.
-        let panic_on_incorrect_value = || {
-            panic!(
-                "Duration variable {} expected to have 2 numbers separated by comma, but got {}",
-                env_var_name, durations_str
-            );
+        let parse_u64 = |v| {
+            u64::from_str(v).unwrap_or_else(|_| {
+                panic!(
+                    "Duration value in variable {env_var_name} is expected to be a number, but got {v}"
+                )
+            })
         };
 
-        let (warn, critical) = (
-            durations.next().unwrap_or_else(panic_on_incorrect_value),
-            durations.next().unwrap_or_else(panic_on_incorrect_value),
-        );
-
+        let warn = parse_u64(warn_str);
+        let critical = parse_u64(critical_str);
         if warn > critical {
             panic!("Test execution warn time should be less or equal to the critical time");
         }
@@ -132,14 +135,13 @@ pub struct TestTimeOptions {
     /// Denotes if the test critical execution time limit excess should be considered
     /// a test failure.
     pub error_on_excess: bool,
-    pub colored: bool,
     pub unit_threshold: TimeThreshold,
     pub integration_threshold: TimeThreshold,
     pub doctest_threshold: TimeThreshold,
 }
 
 impl TestTimeOptions {
-    pub fn new_from_env(error_on_excess: bool, colored: bool) -> Self {
+    pub fn new_from_env(error_on_excess: bool) -> Self {
         let unit_threshold = TimeThreshold::from_env_var(time_constants::UNIT_ENV_NAME)
             .unwrap_or_else(Self::default_unit);
 
@@ -150,7 +152,7 @@ impl TestTimeOptions {
         let doctest_threshold = TimeThreshold::from_env_var(time_constants::DOCTEST_ENV_NAME)
             .unwrap_or_else(Self::default_doctest);
 
-        Self { error_on_excess, colored, unit_threshold, integration_threshold, doctest_threshold }
+        Self { error_on_excess, unit_threshold, integration_threshold, doctest_threshold }
     }
 
     pub fn is_warn(&self, test: &TestDesc, exec_time: &TestExecTime) -> bool {

@@ -1,5 +1,6 @@
-FROM ubuntu:16.04
+FROM ubuntu:22.04
 
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
   g++ \
   make \
@@ -11,12 +12,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   python3 \
   git \
   cmake \
+  bzip2 \
   xz-utils \
   sudo \
   gdb \
   patch \
   libssl-dev \
-  pkg-config
+  pkg-config \
+  zlib1g-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build/
 
@@ -34,6 +38,7 @@ ENV HOSTS=x86_64-unknown-linux-musl
 ENV RUST_CONFIGURE_ARGS \
       --musl-root-x86_64=/usr/local/x86_64-linux-musl \
       --enable-extended \
+      --enable-sanitizers \
       --enable-profiler \
       --enable-lld \
       --set target.x86_64-unknown-linux-musl.crt-static=false \

@@ -1,10 +1,11 @@
-//! The 32-bit unsigned integer type.
+//! Redundant constants module for the [`u32` primitive type][u32].
 //!
-//! *[See also the `u32` primitive type](../../std/primitive.u32.html).*
-//!
-//! Although using these constants won’t cause compilation warnings,
-//! new code should use the associated constants directly on the primitive type.
+//! New code should use the associated constants directly on the primitive type.
 
 #![stable(feature = "rust1", since = "1.0.0")]
+#![deprecated(
+    since = "TBD",
+    note = "all constants in this module replaced by associated constants on `u32`"
+)]
 
 int_module! { u32 }

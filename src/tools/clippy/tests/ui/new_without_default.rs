@@ -1,11 +1,18 @@
-#![feature(const_fn)]
-#![allow(dead_code, clippy::missing_safety_doc)]
+#![allow(
+    dead_code,
+    clippy::missing_safety_doc,
+    clippy::extra_unused_lifetimes,
+    clippy::extra_unused_type_parameters,
+    clippy::needless_lifetimes
+)]
 #![warn(clippy::new_without_default)]
 
 pub struct Foo;
 
 impl Foo {
     pub fn new() -> Foo {
+        //~^ new_without_default
+
         Foo
     }
 }
@@ -14,6 +21,8 @@ pub struct Bar;
 
 impl Bar {
     pub fn new() -> Self {
+        //~^ new_without_default
+
         Bar
     }
 }
@@ -78,9 +87,10 @@ pub struct LtKo<'a> {
 
 impl<'c> LtKo<'c> {
     pub fn new() -> LtKo<'c> {
+        //~^ new_without_default
+
         unimplemented!()
     }
-    // FIXME: that suggestion is missing lifetimes
 }
 
 struct Private;
@@ -91,12 +101,29 @@ impl Private {
     } // We don't lint private items
 }
 
-struct Const;
+struct PrivateStruct;
+
+impl PrivateStruct {
+    pub fn new() -> PrivateStruct {
+        unimplemented!()
+    } // We don't lint public items on private structs
+}
+
+pub struct PrivateItem;
+
+impl PrivateItem {
+    fn new() -> PrivateItem {
+        unimplemented!()
+    } // We don't lint private items on public structs
+}
+
+pub struct Const;
 
 impl Const {
     pub const fn new() -> Const {
+        //~^ new_without_default
         Const
-    } // const fns can't be implemented via Default
+    } // While Default is not const, it can still call const functions, so we should lint this
 }
 
 pub struct IgnoreGenericNew;
@@ -155,8 +182,86 @@ pub struct NewNotEqualToDerive {
 impl NewNotEqualToDerive {
     // This `new` implementation is not equal to a derived `Default`, so do not suggest deriving.
     pub fn new() -> Self {
+        //~^ new_without_default
+
         NewNotEqualToDerive { foo: 1 }
     }
 }
 
+// see #6933
+pub struct FooGenerics<T>(std::marker::PhantomData<T>);
+impl<T> FooGenerics<T> {
+    pub fn new() -> Self {
+        //~^ new_without_default
+
+        Self(Default::default())
+    }
+}
+
+pub struct BarGenerics<T>(std::marker::PhantomData<T>);
+impl<T: Copy> BarGenerics<T> {
+    pub fn new() -> Self {
+        //~^ new_without_default
+
+        Self(Default::default())
+    }
+}
+
+pub mod issue7220 {
+    pub struct Foo<T> {
+        _bar: *mut T,
+    }
+
+    impl<T> Foo<T> {
+        pub fn new() -> Self {
+            //~^ new_without_default
+
+            todo!()
+        }
+    }
+}
+
+// see issue #8152
+// This should not create any lints
+pub struct DocHidden;
+impl DocHidden {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        DocHidden
+    }
+}
+
 fn main() {}
+
+pub struct IgnoreConstGenericNew(usize);
+impl IgnoreConstGenericNew {
+    pub fn new<const N: usize>() -> Self {
+        Self(N)
+    }
+}
+
+pub struct IgnoreLifetimeNew;
+impl IgnoreLifetimeNew {
+    pub fn new<'a>() -> Self {
+        Self
+    }
+}
+
+// From issue #11267
+
+pub struct MyStruct<K, V>
+where
+    K: std::hash::Hash + Eq + PartialEq,
+{
+    _kv: Option<(K, V)>,
+}
+
+impl<K, V> MyStruct<K, V>
+where
+    K: std::hash::Hash + Eq + PartialEq,
+{
+    pub fn new() -> Self {
+        //~^ new_without_default
+        Self { _kv: None }
+    }
+}

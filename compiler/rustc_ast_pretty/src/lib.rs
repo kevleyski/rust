@@ -1,7 +1,10 @@
-#![feature(bool_to_option)]
-#![feature(crate_visibility_modifier)]
-#![feature(or_patterns)]
-#![recursion_limit = "256"]
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![doc(rust_logo)]
+#![feature(box_patterns)]
+#![feature(negative_impls)]
+#![feature(rustdoc_internals)]
+// tidy-alphabetical-end
 
 mod helpers;
 pub mod pp;

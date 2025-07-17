@@ -30,6 +30,7 @@
 /// ```
 #[lang = "not"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[doc(alias = "!")]
 pub trait Not {
     /// The resulting type after applying the `!` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -65,6 +66,16 @@ macro_rules! not_impl {
 }
 
 not_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
+
+#[stable(feature = "not_never", since = "1.60.0")]
+impl Not for ! {
+    type Output = !;
+
+    #[inline]
+    fn not(self) -> ! {
+        match self {}
+    }
+}
 
 /// The bitwise AND operator `&`.
 ///
@@ -109,10 +120,12 @@ not_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 ///     fn bitand(self, Self(rhs): Self) -> Self::Output {
 ///         let Self(lhs) = self;
 ///         assert_eq!(lhs.len(), rhs.len());
-///         Self(lhs.iter()
+///         Self(
+///             lhs.iter()
 ///                 .zip(rhs.iter())
-///                 .map(|(x, y)| *x && *y)
-///                 .collect())
+///                 .map(|(x, y)| *x & *y)
+///                 .collect()
+///         )
 ///     }
 /// }
 ///
@@ -124,7 +137,7 @@ not_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 #[lang = "bitand"]
 #[doc(alias = "&")]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} & {Rhs}`",
     label = "no implementation for `{Self} & {Rhs}`"
 )]
@@ -207,7 +220,12 @@ bitand_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 ///     fn bitor(self, Self(rhs): Self) -> Self::Output {
 ///         let Self(lhs) = self;
 ///         assert_eq!(lhs.len(), rhs.len());
-///         Self(lhs.iter().zip(rhs.iter()).map(|(x, y)| *x || *y).collect())
+///         Self(
+///             lhs.iter()
+///                 .zip(rhs.iter())
+///                 .map(|(x, y)| *x | *y)
+///                 .collect()
+///         )
 ///     }
 /// }
 ///
@@ -219,7 +237,7 @@ bitand_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 #[lang = "bitor"]
 #[doc(alias = "|")]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} | {Rhs}`",
     label = "no implementation for `{Self} | {Rhs}`"
 )]
@@ -302,10 +320,12 @@ bitor_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 ///     fn bitxor(self, Self(rhs): Self) -> Self::Output {
 ///         let Self(lhs) = self;
 ///         assert_eq!(lhs.len(), rhs.len());
-///         Self(lhs.iter()
+///         Self(
+///             lhs.iter()
 ///                 .zip(rhs.iter())
-///                 .map(|(x, y)| (*x || *y) && !(*x && *y))
-///                 .collect())
+///                 .map(|(x, y)| *x ^ *y)
+///                 .collect()
+///         )
 ///     }
 /// }
 ///
@@ -317,7 +337,7 @@ bitor_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 #[lang = "bitxor"]
 #[doc(alias = "^")]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} ^ {Rhs}`",
     label = "no implementation for `{Self} ^ {Rhs}`"
 )]
@@ -416,7 +436,7 @@ bitxor_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 #[lang = "shl"]
 #[doc(alias = "<<")]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} << {Rhs}`",
     label = "no implementation for `{Self} << {Rhs}`"
 )]
@@ -473,7 +493,7 @@ macro_rules! shl_impl_all {
     )*)
 }
 
-shl_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 isize i128 }
+shl_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
 
 /// The right shift operator `>>`. Note that because this trait is implemented
 /// for all integer types with multiple right-hand-side types, Rust's type
@@ -534,7 +554,7 @@ shl_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 isize i128 }
 #[lang = "shr"]
 #[doc(alias = ">>")]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} >> {Rhs}`",
     label = "no implementation for `{Self} >> {Rhs}`"
 )]
@@ -643,11 +663,13 @@ shr_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
 ///     // `rhs` is the "right-hand side" of the expression `a &= b`.
 ///     fn bitand_assign(&mut self, rhs: Self) {
 ///         assert_eq!(self.0.len(), rhs.0.len());
-///         *self = Self(self.0
-///                          .iter()
-///                          .zip(rhs.0.iter())
-///                          .map(|(x, y)| *x && *y)
-///                          .collect());
+///         *self = Self(
+///             self.0
+///                 .iter()
+///                 .zip(rhs.0.iter())
+///                 .map(|(x, y)| *x & *y)
+///                 .collect()
+///         );
 ///     }
 /// }
 ///
@@ -659,7 +681,7 @@ shr_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
 #[lang = "bitand_assign"]
 #[doc(alias = "&=")]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} &= {Rhs}`",
     label = "no implementation for `{Self} &= {Rhs}`"
 )]
@@ -730,7 +752,7 @@ bitand_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 #[lang = "bitor_assign"]
 #[doc(alias = "|=")]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} |= {Rhs}`",
     label = "no implementation for `{Self} |= {Rhs}`"
 )]
@@ -801,7 +823,7 @@ bitor_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 #[lang = "bitxor_assign"]
 #[doc(alias = "^=")]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} ^= {Rhs}`",
     label = "no implementation for `{Self} ^= {Rhs}`"
 )]
@@ -870,7 +892,7 @@ bitxor_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 #[lang = "shl_assign"]
 #[doc(alias = "<<=")]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} <<= {Rhs}`",
     label = "no implementation for `{Self} <<= {Rhs}`"
 )]
@@ -952,7 +974,7 @@ shl_assign_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
 #[lang = "shr_assign"]
 #[doc(alias = ">>=")]
 #[stable(feature = "op_assign_traits", since = "1.8.0")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "no implementation for `{Self} >>= {Rhs}`",
     label = "no implementation for `{Self} >>= {Rhs}`"
 )]

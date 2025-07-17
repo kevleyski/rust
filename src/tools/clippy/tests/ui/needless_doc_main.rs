@@ -5,13 +5,15 @@
 /// This should lint
 /// ```
 /// fn main() {
+//~^ ERROR: needless `fn main` in doctest
 ///     unimplemented!();
 /// }
 /// ```
 ///
 /// With an explicit return type it should lint too
-/// ```
+/// ```edition2015
 /// fn main() -> () {
+//~^ ERROR: needless `fn main` in doctest
 ///     unimplemented!();
 /// }
 /// ```
@@ -19,12 +21,15 @@
 /// This should, too.
 /// ```rust
 /// fn main() {
+//~^ ERROR: needless `fn main` in doctest
 ///     unimplemented!();
 /// }
 /// ```
 ///
 /// This one too.
 /// ```no_run
+/// // the fn is not always the first line
+//~^ ERROR: needless `fn main` in doctest
 /// fn main() {
 ///     unimplemented!();
 /// }
@@ -39,7 +44,7 @@ fn bad_doctests() {}
 /// ```
 ///
 /// This shouldn't lint either, because main is async:
-/// ```
+/// ```edition2018
 /// async fn main() {
 ///     assert_eq!(42, ANSWER);
 /// }
@@ -127,6 +132,12 @@ fn bad_doctests() {}
 /// }
 /// ```
 fn no_false_positives() {}
+
+/// Yields a parse error when interpreted as rust code:
+/// ```
+/// r#"hi"
+/// ```
+fn issue_6022() {}
 
 fn main() {
     bad_doctests();

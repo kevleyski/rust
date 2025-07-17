@@ -1,4 +1,4 @@
-//! A module for working with borrowed data.
+//! Utilities for working with borrowed data.
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
@@ -22,11 +22,11 @@
 /// Types express that they can be borrowed as some type `T` by implementing
 /// `Borrow<T>`, providing a reference to a `T` in the trait’s
 /// [`borrow`] method. A type is free to borrow as several different types.
-/// If it wishes to mutably borrow as the type – allowing the underlying data
+/// If it wishes to mutably borrow as the type, allowing the underlying data
 /// to be modified, it can additionally implement [`BorrowMut<T>`].
 ///
 /// Further, when providing implementations for additional traits, it needs
-/// to be considered whether they should behave identical to those of the
+/// to be considered whether they should behave identically to those of the
 /// underlying type as a consequence of acting as a representation of that
 /// underlying type. Generic code typically uses `Borrow<T>` when it relies
 /// on the identical behavior of these additional trait implementations.
@@ -40,7 +40,6 @@
 /// provide a reference to related type `T`, it is often better to use
 /// [`AsRef<T>`] as more types can safely implement it.
 ///
-/// [`BorrowMut<T>`]: BorrowMut
 /// [`Box<T>`]: ../../std/boxed/struct.Box.html
 /// [`Mutex<T>`]: ../../std/sync/struct.Mutex.html
 /// [`Rc<T>`]: ../../std/rc/struct.Rc.html
@@ -154,6 +153,7 @@
 /// [`HashMap<K, V>`]: ../../std/collections/struct.HashMap.html
 /// [`String`]: ../../std/string/struct.String.html
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "Borrow"]
 pub trait Borrow<Borrowed: ?Sized> {
     /// Immutably borrows from an owned value.
     ///
@@ -183,9 +183,8 @@ pub trait Borrow<Borrowed: ?Sized> {
 /// As a companion to [`Borrow<T>`] this trait allows a type to borrow as
 /// an underlying type by providing a mutable reference. See [`Borrow<T>`]
 /// for more information on borrowing as another type.
-///
-/// [`Borrow<T>`]: Borrow
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "BorrowMut"]
 pub trait BorrowMut<Borrowed: ?Sized>: Borrow<Borrowed> {
     /// Mutably borrows from an owned value.
     ///
@@ -208,6 +207,7 @@ pub trait BorrowMut<Borrowed: ?Sized>: Borrow<Borrowed> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> Borrow<T> for T {
+    #[rustc_diagnostic_item = "noop_method_borrow"]
     fn borrow(&self) -> &T {
         self
     }

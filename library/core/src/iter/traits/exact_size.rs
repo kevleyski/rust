@@ -13,7 +13,23 @@
 /// implement it. However, you may be able to provide a more performant
 /// implementation than the default, so overriding it in this case makes sense.
 ///
+/// Note that this trait is a safe trait and as such does *not* and *cannot*
+/// guarantee that the returned length is correct. This means that `unsafe`
+/// code **must not** rely on the correctness of [`Iterator::size_hint`]. The
+/// unstable and unsafe [`TrustedLen`](super::marker::TrustedLen) trait gives
+/// this additional guarantee.
+///
 /// [`len`]: ExactSizeIterator::len
+///
+/// # When *shouldn't* an adapter be `ExactSizeIterator`?
+///
+/// If an adapter makes an iterator *longer*, then it's usually incorrect for
+/// that adapter to implement `ExactSizeIterator`.  The inner exact-sized
+/// iterator might already be `usize::MAX`-long, and thus the length of the
+/// longer adapted iterator would no longer be exactly representable in `usize`.
+///
+/// This is why [`Chain<A, B>`](crate::iter::Chain) isn't `ExactSizeIterator`,
+/// even when `A` and `B` are both `ExactSizeIterator`.
 ///
 /// # Examples
 ///
@@ -60,13 +76,15 @@
 ///
 /// // And now we can use it!
 ///
-/// let counter = Counter::new();
+/// let mut counter = Counter::new();
 ///
 /// assert_eq!(5, counter.len());
+/// let _ = counter.next();
+/// assert_eq!(4, counter.len());
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait ExactSizeIterator: Iterator {
-    /// Returns the exact length of the iterator.
+    /// Returns the exact remaining length of the iterator.
     ///
     /// The implementation ensures that the iterator will return exactly `len()`
     /// more times a [`Some(T)`] value, before returning [`None`].
@@ -87,9 +105,11 @@ pub trait ExactSizeIterator: Iterator {
     ///
     /// ```
     /// // a finite range knows exactly how many times it will iterate
-    /// let five = 0..5;
+    /// let mut range = 0..5;
     ///
-    /// assert_eq!(5, five.len());
+    /// assert_eq!(5, range.len());
+    /// let _ = range.next();
+    /// assert_eq!(4, range.len());
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]

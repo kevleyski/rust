@@ -1,133 +1,78 @@
 //! Query configuration and description traits.
 
-use crate::dep_graph::DepNode;
-use crate::dep_graph::SerializedDepNodeIndex;
-use crate::query::caches::QueryCache;
-use crate::query::plumbing::CycleError;
-use crate::query::{QueryContext, QueryState};
-use rustc_data_structures::profiling::ProfileCategory;
-
-use rustc_data_structures::fingerprint::Fingerprint;
-use std::borrow::Cow;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-// The parameter `CTX` is required in librustc_middle:
-// implementations may need to access the `'tcx` lifetime in `CTX = TyCtxt<'tcx>`.
-pub trait QueryConfig<CTX> {
-    const NAME: &'static str;
-    const CATEGORY: ProfileCategory;
+use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_span::ErrorGuaranteed;
 
-    type Key: Eq + Hash + Clone + Debug;
-    type Value;
-    type Stored: Clone;
-}
+use super::QueryStackFrameExtra;
+use crate::dep_graph::{DepKind, DepNode, DepNodeParams, SerializedDepNodeIndex};
+use crate::error::HandleCycleError;
+use crate::ich::StableHashingContext;
+use crate::query::caches::QueryCache;
+use crate::query::{CycleError, DepNodeIndex, QueryContext, QueryState};
 
-pub(crate) struct QueryVtable<CTX: QueryContext, K, V> {
-    pub anon: bool,
-    pub dep_kind: CTX::DepKind,
-    pub eval_always: bool,
+pub type HashResult<V> = Option<fn(&mut StableHashingContext<'_>, &V) -> Fingerprint>;
 
-    // Don't use this method to compute query results, instead use the methods on TyCtxt
-    pub compute: fn(CTX, K) -> V,
+pub trait QueryConfig<Qcx: QueryContext>: Copy {
+    fn name(self) -> &'static str;
 
-    pub hash_result: fn(&mut CTX::StableHashingContext, &V) -> Option<Fingerprint>,
-    pub handle_cycle_error: fn(CTX, CycleError<CTX::Query>) -> V,
-    pub cache_on_disk: fn(CTX, &K, Option<&V>) -> bool,
-    pub try_load_from_disk: fn(CTX, SerializedDepNodeIndex) -> Option<V>,
-}
+    // `Key` and `Value` are `Copy` instead of `Clone` to ensure copying them stays cheap,
+    // but it isn't necessary.
+    type Key: DepNodeParams<Qcx::DepContext> + Eq + Hash + Copy + Debug;
+    type Value: Copy;
 
-impl<CTX: QueryContext, K, V> QueryVtable<CTX, K, V> {
-    pub(crate) fn to_dep_node(&self, tcx: CTX, key: &K) -> DepNode<CTX::DepKind>
-    where
-        K: crate::dep_graph::DepNodeParams<CTX>,
-    {
-        DepNode::construct(tcx, self.dep_kind, key)
-    }
+    type Cache: QueryCache<Key = Self::Key, Value = Self::Value>;
 
-    pub(crate) fn compute(&self, tcx: CTX, key: K) -> V {
-        (self.compute)(tcx, key)
-    }
-
-    pub(crate) fn hash_result(
-        &self,
-        hcx: &mut CTX::StableHashingContext,
-        value: &V,
-    ) -> Option<Fingerprint> {
-        (self.hash_result)(hcx, value)
-    }
-
-    pub(crate) fn handle_cycle_error(&self, tcx: CTX, error: CycleError<CTX::Query>) -> V {
-        (self.handle_cycle_error)(tcx, error)
-    }
-
-    pub(crate) fn cache_on_disk(&self, tcx: CTX, key: &K, value: Option<&V>) -> bool {
-        (self.cache_on_disk)(tcx, key, value)
-    }
-
-    pub(crate) fn try_load_from_disk(&self, tcx: CTX, index: SerializedDepNodeIndex) -> Option<V> {
-        (self.try_load_from_disk)(tcx, index)
-    }
-}
-
-pub trait QueryAccessors<CTX: QueryContext>: QueryConfig<CTX> {
-    const ANON: bool;
-    const EVAL_ALWAYS: bool;
-    const DEP_KIND: CTX::DepKind;
-
-    type Cache: QueryCache<Key = Self::Key, Stored = Self::Stored, Value = Self::Value>;
+    fn format_value(self) -> fn(&Self::Value) -> String;
 
     // Don't use this method to access query results, instead use the methods on TyCtxt
-    fn query_state<'a>(tcx: CTX) -> &'a QueryState<CTX, Self::Cache>;
-
-    fn to_dep_node(tcx: CTX, key: &Self::Key) -> DepNode<CTX::DepKind>
+    fn query_state<'a>(self, tcx: Qcx) -> &'a QueryState<Self::Key, Qcx::QueryInfo>
     where
-        Self::Key: crate::dep_graph::DepNodeParams<CTX>,
-    {
-        DepNode::construct(tcx, Self::DEP_KIND, key)
-    }
+        Qcx: 'a;
+
+    // Don't use this method to access query results, instead use the methods on TyCtxt
+    fn query_cache<'a>(self, tcx: Qcx) -> &'a Self::Cache
+    where
+        Qcx: 'a;
+
+    fn cache_on_disk(self, tcx: Qcx::DepContext, key: &Self::Key) -> bool;
 
     // Don't use this method to compute query results, instead use the methods on TyCtxt
-    fn compute(tcx: CTX, key: Self::Key) -> Self::Value;
+    fn execute_query(self, tcx: Qcx::DepContext, k: Self::Key) -> Self::Value;
 
-    fn hash_result(
-        hcx: &mut CTX::StableHashingContext,
-        result: &Self::Value,
-    ) -> Option<Fingerprint>;
+    fn compute(self, tcx: Qcx, key: Self::Key) -> Self::Value;
 
-    fn handle_cycle_error(tcx: CTX, error: CycleError<CTX::Query>) -> Self::Value;
-}
+    fn try_load_from_disk(
+        self,
+        tcx: Qcx,
+        key: &Self::Key,
+        prev_index: SerializedDepNodeIndex,
+        index: DepNodeIndex,
+    ) -> Option<Self::Value>;
 
-pub trait QueryDescription<CTX: QueryContext>: QueryAccessors<CTX> {
-    fn describe(tcx: CTX, key: Self::Key) -> Cow<'static, str>;
+    fn loadable_from_disk(self, qcx: Qcx, key: &Self::Key, idx: SerializedDepNodeIndex) -> bool;
 
-    #[inline]
-    fn cache_on_disk(_: CTX, _: &Self::Key, _: Option<&Self::Value>) -> bool {
-        false
+    /// Synthesize an error value to let compilation continue after a cycle.
+    fn value_from_cycle_error(
+        self,
+        tcx: Qcx::DepContext,
+        cycle_error: &CycleError<QueryStackFrameExtra>,
+        guar: ErrorGuaranteed,
+    ) -> Self::Value;
+
+    fn anon(self) -> bool;
+    fn eval_always(self) -> bool;
+    fn depth_limit(self) -> bool;
+    fn feedable(self) -> bool;
+
+    fn dep_kind(self) -> DepKind;
+    fn handle_cycle_error(self) -> HandleCycleError;
+    fn hash_result(self) -> HashResult<Self::Value>;
+
+    // Just here for convenience and checking that the key matches the kind, don't override this.
+    fn construct_dep_node(self, tcx: Qcx::DepContext, key: &Self::Key) -> DepNode {
+        DepNode::construct(tcx, self.dep_kind(), key)
     }
-
-    fn try_load_from_disk(_: CTX, _: SerializedDepNodeIndex) -> Option<Self::Value> {
-        panic!("QueryDescription::load_from_disk() called for an unsupported query.")
-    }
-}
-
-pub(crate) trait QueryVtableExt<CTX: QueryContext, K, V> {
-    const VTABLE: QueryVtable<CTX, K, V>;
-}
-
-impl<CTX, Q> QueryVtableExt<CTX, Q::Key, Q::Value> for Q
-where
-    CTX: QueryContext,
-    Q: QueryDescription<CTX>,
-{
-    const VTABLE: QueryVtable<CTX, Q::Key, Q::Value> = QueryVtable {
-        anon: Q::ANON,
-        dep_kind: Q::DEP_KIND,
-        eval_always: Q::EVAL_ALWAYS,
-        compute: Q::compute,
-        hash_result: Q::hash_result,
-        handle_cycle_error: Q::handle_cycle_error,
-        cache_on_disk: Q::cache_on_disk,
-        try_load_from_disk: Q::try_load_from_disk,
-    };
 }

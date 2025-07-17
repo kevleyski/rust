@@ -1,22 +1,23 @@
-/// Extracts the successful type of a `Poll<T>`.
+/// Extracts the successful type of a [`Poll<T>`].
 ///
-/// This macro bakes in propagation of `Pending` signals by returning early.
+/// This macro bakes in propagation of [`Pending`] signals by returning early.
+///
+/// [`Poll<T>`]: crate::task::Poll
+/// [`Pending`]: crate::task::Poll::Pending
 ///
 /// # Examples
 ///
 /// ```
-/// #![feature(ready_macro)]
-///
-/// use core::task::{ready, Context, Poll};
-/// use core::future::{self, Future};
-/// use core::pin::Pin;
+/// use std::task::{ready, Context, Poll};
+/// use std::future::{self, Future};
+/// use std::pin::Pin;
 ///
 /// pub fn do_poll(cx: &mut Context<'_>) -> Poll<()> {
 ///     let mut fut = future::ready(42);
 ///     let fut = Pin::new(&mut fut);
 ///
 ///     let num = ready!(fut.poll(cx));
-///     # drop(num);
+///     # let _ = num;
 ///     // ... use num
 ///
 ///     Poll::Ready(())
@@ -26,11 +27,9 @@
 /// The `ready!` call expands to:
 ///
 /// ```
-/// # #![feature(ready_macro)]
-/// #
-/// # use core::task::{Context, Poll};
-/// # use core::future::{self, Future};
-/// # use core::pin::Pin;
+/// # use std::task::{Context, Poll};
+/// # use std::future::{self, Future};
+/// # use std::pin::Pin;
 /// #
 /// # pub fn do_poll(cx: &mut Context<'_>) -> Poll<()> {
 ///     # let mut fut = future::ready(42);
@@ -40,13 +39,13 @@
 ///     Poll::Ready(t) => t,
 ///     Poll::Pending => return Poll::Pending,
 /// };
-///     # drop(num);
+///     # let _ = num; // to silence unused warning
 ///     # // ... use num
 ///     #
 ///     # Poll::Ready(())
 /// # }
 /// ```
-#[unstable(feature = "ready_macro", issue = "70922")]
+#[stable(feature = "ready_macro", since = "1.64.0")]
 #[rustc_macro_transparency = "semitransparent"]
 pub macro ready($e:expr) {
     match $e {

@@ -3,46 +3,41 @@
 #[cfg(test)]
 mod tests;
 
-use crate::io::prelude::*;
-
-use crate::cell::RefCell;
+use crate::cell::{Cell, RefCell};
 use crate::fmt;
-use crate::io::{self, BufReader, Initializer, IoSlice, IoSliceMut, LineWriter};
-use crate::lazy::SyncOnceCell;
-use crate::sync::atomic::{AtomicBool, Ordering};
-use crate::sync::{Mutex, MutexGuard};
+use crate::fs::File;
+use crate::io::prelude::*;
+use crate::io::{
+    self, BorrowedCursor, BufReader, IoSlice, IoSliceMut, LineWriter, Lines, SpecReadByte,
+};
+use crate::panic::{RefUnwindSafe, UnwindSafe};
+use crate::sync::atomic::{Atomic, AtomicBool, Ordering};
+use crate::sync::{Arc, Mutex, MutexGuard, OnceLock, ReentrantLock, ReentrantLockGuard};
 use crate::sys::stdio;
-use crate::sys_common;
-use crate::sys_common::remutex::{ReentrantMutex, ReentrantMutexGuard};
-use crate::thread::LocalKey;
+use crate::thread::AccessError;
+
+type LocalStream = Arc<Mutex<Vec<u8>>>;
 
 thread_local! {
-    /// Used by the test crate to capture the output of the print! and println! macros.
-    static LOCAL_STDOUT: RefCell<Option<Box<dyn Write + Send>>> = {
-        RefCell::new(None)
+    /// Used by the test crate to capture the output of the print macros and panics.
+    static OUTPUT_CAPTURE: Cell<Option<LocalStream>> = const {
+        Cell::new(None)
     }
 }
 
-thread_local! {
-    /// Used by the test crate to capture the output of the eprint! and eprintln! macros, and panics.
-    static LOCAL_STDERR: RefCell<Option<Box<dyn Write + Send>>> = {
-        RefCell::new(None)
-    }
-}
-
-/// Flag to indicate LOCAL_STDOUT and/or LOCAL_STDERR is used.
+/// Flag to indicate OUTPUT_CAPTURE is used.
 ///
-/// If both are None and were never set on any thread, this flag is set to
-/// false, and both LOCAL_STDOUT and LOCAL_STDOUT can be safely ignored on all
-/// threads, saving some time and memory registering an unused thread local.
+/// If it is None and was never set on any thread, this flag is set to false,
+/// and OUTPUT_CAPTURE can be safely ignored on all threads, saving some time
+/// and memory registering an unused thread local.
 ///
-/// Note about memory ordering: This contains information about whether two
-/// thread local variables might be in use. Although this is a global flag, the
+/// Note about memory ordering: This contains information about whether a
+/// thread local variable might be in use. Although this is a global flag, the
 /// memory ordering between threads does not matter: we only want this flag to
-/// have a consistent order between set_print/set_panic and print_to *within
+/// have a consistent order between set_output_capture and print_to *within
 /// the same thread*. Within the same thread, things always have a perfectly
 /// consistent order. So Ordering::Relaxed is fine.
-static LOCAL_STREAMS: AtomicBool = AtomicBool::new(false);
+static OUTPUT_CAPTURE_USED: Atomic<bool> = AtomicBool::new(false);
 
 /// A handle to a raw instance of the standard input stream of this process.
 ///
@@ -102,11 +97,15 @@ const fn stderr_raw() -> StderrRaw {
 
 impl Read for StdinRaw {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        handle_ebadf(self.0.read(buf), 0)
+        handle_ebadf(self.0.read(buf), || Ok(0))
+    }
+
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        handle_ebadf(self.0.read_buf(buf), || Ok(()))
     }
 
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        handle_ebadf(self.0.read_vectored(bufs), 0)
+        handle_ebadf(self.0.read_vectored(bufs), || Ok(0))
     }
 
     #[inline]
@@ -114,27 +113,36 @@ impl Read for StdinRaw {
         self.0.is_read_vectored()
     }
 
-    #[inline]
-    unsafe fn initializer(&self) -> Initializer {
-        Initializer::nop()
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        handle_ebadf(self.0.read_exact(buf), || Err(io::Error::READ_EXACT_EOF))
+    }
+
+    fn read_buf_exact(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        if buf.capacity() == 0 {
+            return Ok(());
+        }
+        handle_ebadf(self.0.read_buf_exact(buf), || Err(io::Error::READ_EXACT_EOF))
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        handle_ebadf(self.0.read_to_end(buf), 0)
+        handle_ebadf(self.0.read_to_end(buf), || Ok(0))
     }
 
     fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
-        handle_ebadf(self.0.read_to_string(buf), 0)
+        handle_ebadf(self.0.read_to_string(buf), || Ok(0))
     }
 }
 
 impl Write for StdoutRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        handle_ebadf(self.0.write(buf), buf.len())
+        handle_ebadf(self.0.write(buf), || Ok(buf.len()))
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        let total = bufs.iter().map(|b| b.len()).sum();
+        let total = || Ok(bufs.iter().map(|b| b.len()).sum());
         handle_ebadf(self.0.write_vectored(bufs), total)
     }
 
@@ -144,29 +152,29 @@ impl Write for StdoutRaw {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        handle_ebadf(self.0.flush(), ())
+        handle_ebadf(self.0.flush(), || Ok(()))
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        handle_ebadf(self.0.write_all(buf), ())
+        handle_ebadf(self.0.write_all(buf), || Ok(()))
     }
 
     fn write_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
-        handle_ebadf(self.0.write_all_vectored(bufs), ())
+        handle_ebadf(self.0.write_all_vectored(bufs), || Ok(()))
     }
 
     fn write_fmt(&mut self, fmt: fmt::Arguments<'_>) -> io::Result<()> {
-        handle_ebadf(self.0.write_fmt(fmt), ())
+        handle_ebadf(self.0.write_fmt(fmt), || Ok(()))
     }
 }
 
 impl Write for StderrRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        handle_ebadf(self.0.write(buf), buf.len())
+        handle_ebadf(self.0.write(buf), || Ok(buf.len()))
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        let total = bufs.iter().map(|b| b.len()).sum();
+        let total = || Ok(bufs.iter().map(|b| b.len()).sum());
         handle_ebadf(self.0.write_vectored(bufs), total)
     }
 
@@ -176,25 +184,25 @@ impl Write for StderrRaw {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        handle_ebadf(self.0.flush(), ())
+        handle_ebadf(self.0.flush(), || Ok(()))
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        handle_ebadf(self.0.write_all(buf), ())
+        handle_ebadf(self.0.write_all(buf), || Ok(()))
     }
 
     fn write_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
-        handle_ebadf(self.0.write_all_vectored(bufs), ())
+        handle_ebadf(self.0.write_all_vectored(bufs), || Ok(()))
     }
 
     fn write_fmt(&mut self, fmt: fmt::Arguments<'_>) -> io::Result<()> {
-        handle_ebadf(self.0.write_fmt(fmt), ())
+        handle_ebadf(self.0.write_fmt(fmt), || Ok(()))
     }
 }
 
-fn handle_ebadf<T>(r: io::Result<T>, default: T) -> io::Result<T> {
+fn handle_ebadf<T>(r: io::Result<T>, default: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     match r {
-        Err(ref e) if stdio::is_ebadf(e) => Ok(default),
+        Err(ref e) if stdio::is_ebadf(e) => default(),
         r => r,
     }
 }
@@ -213,55 +221,69 @@ fn handle_ebadf<T>(r: io::Result<T>, default: T) -> io::Result<T> {
 ///
 /// [`io::stdin`]: stdin
 ///
-/// ### Note: Windows Portability Consideration
+/// ### Note: Windows Portability Considerations
 ///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to read bytes that are not valid UTF-8 will return
 /// an error.
 ///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
+///
 /// # Examples
 ///
 /// ```no_run
-/// use std::io::{self, Read};
+/// use std::io;
 ///
 /// fn main() -> io::Result<()> {
 ///     let mut buffer = String::new();
-///     let mut stdin = io::stdin(); // We get `Stdin` here.
-///     stdin.read_to_string(&mut buffer)?;
+///     let stdin = io::stdin(); // We get `Stdin` here.
+///     stdin.read_line(&mut buffer)?;
 ///     Ok(())
 /// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "Stdin")]
 pub struct Stdin {
     inner: &'static Mutex<BufReader<StdinRaw>>,
 }
 
-/// A locked reference to the `Stdin` handle.
+/// A locked reference to the [`Stdin`] handle.
 ///
 /// This handle implements both the [`Read`] and [`BufRead`] traits, and
 /// is constructed via the [`Stdin::lock`] method.
 ///
-/// ### Note: Windows Portability Consideration
+/// ### Note: Windows Portability Considerations
 ///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to read bytes that are not valid UTF-8 will return
 /// an error.
 ///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
+///
 /// # Examples
 ///
 /// ```no_run
-/// use std::io::{self, Read};
+/// use std::io::{self, BufRead};
 ///
 /// fn main() -> io::Result<()> {
 ///     let mut buffer = String::new();
 ///     let stdin = io::stdin(); // We get `Stdin` here.
 ///     {
-///         let mut stdin_lock = stdin.lock(); // We get `StdinLock` here.
-///         stdin_lock.read_to_string(&mut buffer)?;
+///         let mut handle = stdin.lock(); // We get `StdinLock` here.
+///         handle.read_line(&mut buffer)?;
 ///     } // `StdinLock` is dropped here.
 ///     Ok(())
 /// }
 /// ```
+#[must_use = "if unused stdin will immediately unlock"]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StdinLock<'a> {
     inner: MutexGuard<'a, BufReader<StdinRaw>>,
@@ -273,21 +295,28 @@ pub struct StdinLock<'a> {
 /// is synchronized via a mutex. If you need more explicit control over
 /// locking, see the [`Stdin::lock`] method.
 ///
-/// ### Note: Windows Portability Consideration
+/// ### Note: Windows Portability Considerations
+///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to read bytes that are not valid UTF-8 will return
 /// an error.
+///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
 ///
 /// # Examples
 ///
 /// Using implicit synchronization:
 ///
 /// ```no_run
-/// use std::io::{self, Read};
+/// use std::io;
 ///
 /// fn main() -> io::Result<()> {
 ///     let mut buffer = String::new();
-///     io::stdin().read_to_string(&mut buffer)?;
+///     io::stdin().read_line(&mut buffer)?;
 ///     Ok(())
 /// }
 /// ```
@@ -295,20 +324,21 @@ pub struct StdinLock<'a> {
 /// Using explicit synchronization:
 ///
 /// ```no_run
-/// use std::io::{self, Read};
+/// use std::io::{self, BufRead};
 ///
 /// fn main() -> io::Result<()> {
 ///     let mut buffer = String::new();
 ///     let stdin = io::stdin();
 ///     let mut handle = stdin.lock();
 ///
-///     handle.read_to_string(&mut buffer)?;
+///     handle.read_line(&mut buffer)?;
 ///     Ok(())
 /// }
 /// ```
+#[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stdin() -> Stdin {
-    static INSTANCE: SyncOnceCell<Mutex<BufReader<StdinRaw>>> = SyncOnceCell::new();
+    static INSTANCE: OnceLock<Mutex<BufReader<StdinRaw>>> = OnceLock::new();
     Stdin {
         inner: INSTANCE.get_or_init(|| {
             Mutex::new(BufReader::with_capacity(stdio::STDIN_BUF_SIZE, stdin_raw()))
@@ -327,26 +357,33 @@ impl Stdin {
     /// # Examples
     ///
     /// ```no_run
-    /// use std::io::{self, Read};
+    /// use std::io::{self, BufRead};
     ///
     /// fn main() -> io::Result<()> {
     ///     let mut buffer = String::new();
     ///     let stdin = io::stdin();
     ///     let mut handle = stdin.lock();
     ///
-    ///     handle.read_to_string(&mut buffer)?;
+    ///     handle.read_line(&mut buffer)?;
     ///     Ok(())
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn lock(&self) -> StdinLock<'_> {
+    pub fn lock(&self) -> StdinLock<'static> {
+        // Locks this handle with 'static lifetime. This depends on the
+        // implementation detail that the underlying `Mutex` is static.
         StdinLock { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
     }
 
     /// Locks this handle and reads a line of input, appending it to the specified buffer.
     ///
     /// For detailed semantics of this method, see the documentation on
-    /// [`BufRead::read_line`].
+    /// [`BufRead::read_line`]. In particular:
+    /// * Previous content of the buffer will be preserved. To avoid appending
+    ///   to the buffer, you need to [`clear`] it first.
+    /// * The trailing newline character, if any, is included in the buffer.
+    ///
+    /// [`clear`]: String::clear
     ///
     /// # Examples
     ///
@@ -356,10 +393,10 @@ impl Stdin {
     /// let mut input = String::new();
     /// match io::stdin().read_line(&mut input) {
     ///     Ok(n) => {
-    ///         println!("{} bytes read", n);
-    ///         println!("{}", input);
+    ///         println!("{n} bytes read");
+    ///         println!("{input}");
     ///     }
-    ///     Err(error) => println!("error: {}", error),
+    ///     Err(error) => println!("error: {error}"),
     /// }
     /// ```
     ///
@@ -370,15 +407,37 @@ impl Stdin {
     ///   in which case it will wait for the Enter key to be pressed before
     ///   continuing
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_confusables("get_line")]
     pub fn read_line(&self, buf: &mut String) -> io::Result<usize> {
         self.lock().read_line(buf)
+    }
+
+    /// Consumes this handle and returns an iterator over input lines.
+    ///
+    /// For detailed semantics of this method, see the documentation on
+    /// [`BufRead::lines`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io;
+    ///
+    /// let lines = io::stdin().lines();
+    /// for line in lines {
+    ///     println!("got a line: {}", line.unwrap());
+    /// }
+    /// ```
+    #[must_use = "`self` will be dropped if the result is not used"]
+    #[stable(feature = "stdin_forwarders", since = "1.62.0")]
+    pub fn lines(self) -> Lines<StdinLock<'static>> {
+        self.lock().lines()
     }
 }
 
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for Stdin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Stdin { .. }")
+        f.debug_struct("Stdin").finish_non_exhaustive()
     }
 }
 
@@ -387,16 +446,15 @@ impl Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.lock().read(buf)
     }
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        self.lock().read_buf(buf)
+    }
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.lock().read_vectored(bufs)
     }
     #[inline]
     fn is_read_vectored(&self) -> bool {
         self.lock().is_read_vectored()
-    }
-    #[inline]
-    unsafe fn initializer(&self) -> Initializer {
-        Initializer::nop()
     }
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         self.lock().read_to_end(buf)
@@ -407,12 +465,56 @@ impl Read for Stdin {
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         self.lock().read_exact(buf)
     }
+    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+        self.lock().read_buf_exact(cursor)
+    }
+}
+
+#[stable(feature = "read_shared_stdin", since = "1.78.0")]
+impl Read for &Stdin {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.lock().read(buf)
+    }
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        self.lock().read_buf(buf)
+    }
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        self.lock().read_vectored(bufs)
+    }
+    #[inline]
+    fn is_read_vectored(&self) -> bool {
+        self.lock().is_read_vectored()
+    }
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        self.lock().read_to_end(buf)
+    }
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        self.lock().read_to_string(buf)
+    }
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.lock().read_exact(buf)
+    }
+    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+        self.lock().read_buf_exact(cursor)
+    }
+}
+
+// only used by platform-dependent io::copy specializations, i.e. unused on some platforms
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl StdinLock<'_> {
+    pub(crate) fn as_mut_buf(&mut self) -> &mut BufReader<impl Read> {
+        &mut self.inner
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Read for StdinLock<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
+    }
+
+    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+        self.inner.read_buf(buf)
     }
 
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
@@ -422,11 +524,6 @@ impl Read for StdinLock<'_> {
     #[inline]
     fn is_read_vectored(&self) -> bool {
         self.inner.is_read_vectored()
-    }
-
-    #[inline]
-    unsafe fn initializer(&self) -> Initializer {
-        Initializer::nop()
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
@@ -439,6 +536,17 @@ impl Read for StdinLock<'_> {
 
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         self.inner.read_exact(buf)
+    }
+
+    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+        self.inner.read_buf_exact(cursor)
+    }
+}
+
+impl SpecReadByte for StdinLock<'_> {
+    #[inline]
+    fn spec_read_byte(&mut self) -> Option<io::Result<u8>> {
+        BufReader::spec_read_byte(&mut *self.inner)
     }
 }
 
@@ -464,7 +572,7 @@ impl BufRead for StdinLock<'_> {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for StdinLock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("StdinLock { .. }")
+        f.debug_struct("StdinLock").finish_non_exhaustive()
     }
 }
 
@@ -474,36 +582,66 @@ impl fmt::Debug for StdinLock<'_> {
 /// output stream. Access is also synchronized via a lock and explicit control
 /// over locking is available via the [`lock`] method.
 ///
+/// By default, the handle is line-buffered when connected to a terminal, meaning
+/// it flushes automatically when a newline (`\n`) is encountered. For immediate
+/// output, you can manually call the [`flush`] method. When the handle goes out
+/// of scope, the buffer is automatically flushed.
+///
 /// Created by the [`io::stdout`] method.
 ///
-/// ### Note: Windows Portability Consideration
+/// ### Note: Windows Portability Considerations
+///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
 /// an error.
 ///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
+///
 /// [`lock`]: Stdout::lock
+/// [`flush`]: Write::flush
 /// [`io::stdout`]: stdout
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdout {
     // FIXME: this should be LineWriter or BufWriter depending on the state of
     //        stdout (tty or not). Note that if this is not line buffered it
     //        should also flush-on-panic or some form of flush-on-abort.
-    inner: &'static ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>,
+    inner: &'static ReentrantLock<RefCell<LineWriter<StdoutRaw>>>,
 }
 
-/// A locked reference to the `Stdout` handle.
+/// A locked reference to the [`Stdout`] handle.
 ///
 /// This handle implements the [`Write`] trait, and is constructed via
-/// the [`Stdout::lock`] method.
+/// the [`Stdout::lock`] method. See its documentation for more.
 ///
-/// ### Note: Windows Portability Consideration
+/// By default, the handle is line-buffered when connected to a terminal, meaning
+/// it flushes automatically when a newline (`\n`) is encountered. For immediate
+/// output, you can manually call the [`flush`] method. When the handle goes out
+/// of scope, the buffer is automatically flushed.
+///
+/// ### Note: Windows Portability Considerations
+///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
 /// an error.
+///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
+///
+/// [`flush`]: Write::flush
+#[must_use = "if unused stdout will immediately unlock"]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StdoutLock<'a> {
-    inner: ReentrantMutexGuard<'a, RefCell<LineWriter<StdoutRaw>>>,
+    inner: ReentrantLockGuard<'a, RefCell<LineWriter<StdoutRaw>>>,
 }
+
+static STDOUT: OnceLock<ReentrantLock<RefCell<LineWriter<StdoutRaw>>>> = OnceLock::new();
 
 /// Constructs a new handle to the standard output of the current process.
 ///
@@ -511,10 +649,22 @@ pub struct StdoutLock<'a> {
 /// is synchronized via a mutex. If you need more explicit control over
 /// locking, see the [`Stdout::lock`] method.
 ///
-/// ### Note: Windows Portability Consideration
+/// By default, the handle is line-buffered when connected to a terminal, meaning
+/// it flushes automatically when a newline (`\n`) is encountered. For immediate
+/// output, you can manually call the [`flush`] method. When the handle goes out
+/// of scope, the buffer is automatically flushed.
+///
+/// ### Note: Windows Portability Considerations
+///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
 /// an error.
+///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
 ///
 /// # Examples
 ///
@@ -544,29 +694,50 @@ pub struct StdoutLock<'a> {
 ///     Ok(())
 /// }
 /// ```
+///
+/// Ensuring output is flushed immediately:
+///
+/// ```no_run
+/// use std::io::{self, Write};
+///
+/// fn main() -> io::Result<()> {
+///     let mut stdout = io::stdout();
+///     stdout.write_all(b"hello, ")?;
+///     stdout.flush()?;                // Manual flush
+///     stdout.write_all(b"world!\n")?; // Automatically flushed
+///     Ok(())
+/// }
+/// ```
+///
+/// [`flush`]: Write::flush
+#[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "io_stdout")]
 pub fn stdout() -> Stdout {
-    static INSTANCE: SyncOnceCell<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>> =
-        SyncOnceCell::new();
     Stdout {
-        inner: INSTANCE.get_or_init(|| unsafe {
-            let _ = sys_common::at_exit(|| {
-                if let Some(instance) = INSTANCE.get() {
-                    // Flush the data and disable buffering during shutdown
-                    // by replacing the line writer by one with zero
-                    // buffering capacity.
-                    // We use try_lock() instead of lock(), because someone
-                    // might have leaked a StdoutLock, which would
-                    // otherwise cause a deadlock here.
-                    if let Some(lock) = instance.try_lock() {
-                        *lock.borrow_mut() = LineWriter::with_capacity(0, stdout_raw());
-                    }
-                }
-            });
-            let r = ReentrantMutex::new(RefCell::new(LineWriter::new(stdout_raw())));
-            r.init();
-            r
-        }),
+        inner: STDOUT
+            .get_or_init(|| ReentrantLock::new(RefCell::new(LineWriter::new(stdout_raw())))),
+    }
+}
+
+// Flush the data and disable buffering during shutdown
+// by replacing the line writer by one with zero
+// buffering capacity.
+pub fn cleanup() {
+    let mut initialized = false;
+    let stdout = STDOUT.get_or_init(|| {
+        initialized = true;
+        ReentrantLock::new(RefCell::new(LineWriter::with_capacity(0, stdout_raw())))
+    });
+
+    if !initialized {
+        // The buffer was previously initialized, overwrite it here.
+        // We use try_lock() instead of lock(), because someone
+        // might have leaked a StdoutLock, which would
+        // otherwise cause a deadlock here.
+        if let Some(lock) = stdout.try_lock() {
+            *lock.borrow_mut() = LineWriter::with_capacity(0, stdout_raw());
+        }
     }
 }
 
@@ -583,24 +754,32 @@ impl Stdout {
     /// use std::io::{self, Write};
     ///
     /// fn main() -> io::Result<()> {
-    ///     let stdout = io::stdout();
-    ///     let mut handle = stdout.lock();
+    ///     let mut stdout = io::stdout().lock();
     ///
-    ///     handle.write_all(b"hello world")?;
+    ///     stdout.write_all(b"hello world")?;
     ///
     ///     Ok(())
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn lock(&self) -> StdoutLock<'_> {
+    pub fn lock(&self) -> StdoutLock<'static> {
+        // Locks this handle with 'static lifetime. This depends on the
+        // implementation detail that the underlying `ReentrantMutex` is
+        // static.
         StdoutLock { inner: self.inner.lock() }
     }
 }
 
+#[stable(feature = "catch_unwind", since = "1.9.0")]
+impl UnwindSafe for Stdout {}
+
+#[stable(feature = "catch_unwind", since = "1.9.0")]
+impl RefUnwindSafe for Stdout {}
+
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for Stdout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Stdout { .. }")
+        f.debug_struct("Stdout").finish_non_exhaustive()
     }
 }
 
@@ -656,6 +835,12 @@ impl Write for &Stdout {
     }
 }
 
+#[stable(feature = "catch_unwind", since = "1.9.0")]
+impl UnwindSafe for StdoutLock<'_> {}
+
+#[stable(feature = "catch_unwind", since = "1.9.0")]
+impl RefUnwindSafe for StdoutLock<'_> {}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Write for StdoutLock<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -682,7 +867,7 @@ impl Write for StdoutLock<'_> {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for StdoutLock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("StdoutLock { .. }")
+        f.debug_struct("StdoutLock").finish_non_exhaustive()
     }
 }
 
@@ -692,37 +877,59 @@ impl fmt::Debug for StdoutLock<'_> {
 ///
 /// [`io::stderr`]: stderr
 ///
-/// ### Note: Windows Portability Consideration
+/// ### Note: Windows Portability Considerations
+///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
 /// an error.
+///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stderr {
-    inner: &'static ReentrantMutex<RefCell<StderrRaw>>,
+    inner: &'static ReentrantLock<RefCell<StderrRaw>>,
 }
 
-/// A locked reference to the `Stderr` handle.
+/// A locked reference to the [`Stderr`] handle.
 ///
-/// This handle implements the `Write` trait and is constructed via
-/// the [`Stderr::lock`] method.
+/// This handle implements the [`Write`] trait and is constructed via
+/// the [`Stderr::lock`] method. See its documentation for more.
 ///
-/// ### Note: Windows Portability Consideration
+/// ### Note: Windows Portability Considerations
+///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
 /// an error.
+///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
+#[must_use = "if unused stderr will immediately unlock"]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct StderrLock<'a> {
-    inner: ReentrantMutexGuard<'a, RefCell<StderrRaw>>,
+    inner: ReentrantLockGuard<'a, RefCell<StderrRaw>>,
 }
 
 /// Constructs a new handle to the standard error of the current process.
 ///
 /// This handle is not buffered.
 ///
-/// ### Note: Windows Portability Consideration
+/// ### Note: Windows Portability Considerations
+///
 /// When operating in a console, the Windows implementation of this stream does not support
 /// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
 /// an error.
+///
+/// In a process with a detached console, such as one using
+/// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
+/// the contained handle will be null. In such cases, the standard library's `Read` and
+/// `Write` will do nothing and silently succeed. All other I/O operations, via the
+/// standard library or via raw Windows API calls, will fail.
 ///
 /// # Examples
 ///
@@ -752,24 +959,17 @@ pub struct StderrLock<'a> {
 ///     Ok(())
 /// }
 /// ```
+#[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "io_stderr")]
 pub fn stderr() -> Stderr {
-    // Note that unlike `stdout()` we don't use `Lazy` here which registers a
-    // destructor. Stderr is not buffered nor does the `stderr_raw` type consume
-    // any owned resources, so there's no need to run any destructors at some
-    // point in the future.
-    //
-    // This has the added benefit of allowing `stderr` to be usable during
-    // process shutdown as well!
-    static INSTANCE: SyncOnceCell<ReentrantMutex<RefCell<StderrRaw>>> = SyncOnceCell::new();
+    // Note that unlike `stdout()` we don't use `at_exit` here to register a
+    // destructor. Stderr is not buffered, so there's no need to run a
+    // destructor for flushing the buffer
+    static INSTANCE: ReentrantLock<RefCell<StderrRaw>> =
+        ReentrantLock::new(RefCell::new(stderr_raw()));
 
-    Stderr {
-        inner: INSTANCE.get_or_init(|| unsafe {
-            let r = ReentrantMutex::new(RefCell::new(stderr_raw()));
-            r.init();
-            r
-        }),
-    }
+    Stderr { inner: &INSTANCE }
 }
 
 impl Stderr {
@@ -794,15 +994,24 @@ impl Stderr {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn lock(&self) -> StderrLock<'_> {
+    pub fn lock(&self) -> StderrLock<'static> {
+        // Locks this handle with 'static lifetime. This depends on the
+        // implementation detail that the underlying `ReentrantMutex` is
+        // static.
         StderrLock { inner: self.inner.lock() }
     }
 }
 
+#[stable(feature = "catch_unwind", since = "1.9.0")]
+impl UnwindSafe for Stderr {}
+
+#[stable(feature = "catch_unwind", since = "1.9.0")]
+impl RefUnwindSafe for Stderr {}
+
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for Stderr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Stderr { .. }")
+        f.debug_struct("Stderr").finish_non_exhaustive()
     }
 }
 
@@ -858,6 +1067,12 @@ impl Write for &Stderr {
     }
 }
 
+#[stable(feature = "catch_unwind", since = "1.9.0")]
+impl UnwindSafe for StderrLock<'_> {}
+
+#[stable(feature = "catch_unwind", since = "1.9.0")]
+impl RefUnwindSafe for StderrLock<'_> {}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Write for StderrLock<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -884,115 +1099,170 @@ impl Write for StderrLock<'_> {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for StderrLock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("StderrLock { .. }")
+        f.debug_struct("StderrLock").finish_non_exhaustive()
     }
 }
 
-/// Resets the thread-local stderr handle to the specified writer
-///
-/// This will replace the current thread's stderr handle, returning the old
-/// handle. All future calls to `panic!` and friends will emit their output to
-/// this specified handle.
-///
-/// Note that this does not need to be called for all new threads; the default
-/// output handle is to the process's stderr stream.
+/// Sets the thread-local output capture buffer and returns the old one.
 #[unstable(
-    feature = "set_stdio",
-    reason = "this function may disappear completely or be replaced \
-                     with a more general mechanism",
+    feature = "internal_output_capture",
+    reason = "this function is meant for use in the test crate \
+        and may disappear in the future",
     issue = "none"
 )]
 #[doc(hidden)]
-pub fn set_panic(sink: Option<Box<dyn Write + Send>>) -> Option<Box<dyn Write + Send>> {
-    use crate::mem;
-    if sink.is_none() && !LOCAL_STREAMS.load(Ordering::Relaxed) {
-        // LOCAL_STDERR is definitely None since LOCAL_STREAMS is false.
-        return None;
-    }
-    let s = LOCAL_STDERR.with(move |slot| mem::replace(&mut *slot.borrow_mut(), sink)).and_then(
-        |mut s| {
-            let _ = s.flush();
-            Some(s)
-        },
-    );
-    LOCAL_STREAMS.store(true, Ordering::Relaxed);
-    s
+pub fn set_output_capture(sink: Option<LocalStream>) -> Option<LocalStream> {
+    try_set_output_capture(sink).expect(
+        "cannot access a Thread Local Storage value \
+         during or after destruction",
+    )
 }
 
-/// Resets the thread-local stdout handle to the specified writer
-///
-/// This will replace the current thread's stdout handle, returning the old
-/// handle. All future calls to `print!` and friends will emit their output to
-/// this specified handle.
-///
-/// Note that this does not need to be called for all new threads; the default
-/// output handle is to the process's stdout stream.
+/// Tries to set the thread-local output capture buffer and returns the old one.
+/// This may fail once thread-local destructors are called. It's used in panic
+/// handling instead of `set_output_capture`.
 #[unstable(
-    feature = "set_stdio",
-    reason = "this function may disappear completely or be replaced \
-                     with a more general mechanism",
+    feature = "internal_output_capture",
+    reason = "this function is meant for use in the test crate \
+    and may disappear in the future",
     issue = "none"
 )]
 #[doc(hidden)]
-pub fn set_print(sink: Option<Box<dyn Write + Send>>) -> Option<Box<dyn Write + Send>> {
-    use crate::mem;
-    if sink.is_none() && !LOCAL_STREAMS.load(Ordering::Relaxed) {
-        // LOCAL_STDOUT is definitely None since LOCAL_STREAMS is false.
-        return None;
+pub fn try_set_output_capture(
+    sink: Option<LocalStream>,
+) -> Result<Option<LocalStream>, AccessError> {
+    if sink.is_none() && !OUTPUT_CAPTURE_USED.load(Ordering::Relaxed) {
+        // OUTPUT_CAPTURE is definitely None since OUTPUT_CAPTURE_USED is false.
+        return Ok(None);
     }
-    let s = LOCAL_STDOUT.with(move |slot| mem::replace(&mut *slot.borrow_mut(), sink)).and_then(
-        |mut s| {
-            let _ = s.flush();
-            Some(s)
-        },
-    );
-    LOCAL_STREAMS.store(true, Ordering::Relaxed);
-    s
+    OUTPUT_CAPTURE_USED.store(true, Ordering::Relaxed);
+    OUTPUT_CAPTURE.try_with(move |slot| slot.replace(sink))
 }
 
-/// Write `args` to output stream `local_s` if possible, `global_s`
+/// Writes `args` to the capture buffer if enabled and possible, or `global_s`
 /// otherwise. `label` identifies the stream in a panic message.
 ///
 /// This function is used to print error messages, so it takes extra
-/// care to avoid causing a panic when `local_s` is unusable.
-/// For instance, if the TLS key for the local stream is
-/// already destroyed, or if the local stream is locked by another
-/// thread, it will just fall back to the global stream.
+/// care to avoid causing a panic when `OUTPUT_CAPTURE` is unusable.
+/// For instance, if the TLS key for output capturing is already destroyed, or
+/// if the local stream is in use by another thread, it will just fall back to
+/// the global stream.
 ///
 /// However, if the actual I/O causes an error, this function does panic.
-fn print_to<T>(
-    args: fmt::Arguments<'_>,
-    local_s: &'static LocalKey<RefCell<Option<Box<dyn Write + Send>>>>,
-    global_s: fn() -> T,
-    label: &str,
-) where
+///
+/// Writing to non-blocking stdout/stderr can cause an error, which will lead
+/// this function to panic.
+fn print_to<T>(args: fmt::Arguments<'_>, global_s: fn() -> T, label: &str)
+where
     T: Write,
 {
-    let result = LOCAL_STREAMS
-        .load(Ordering::Relaxed)
-        .then(|| {
-            local_s
-                .try_with(|s| {
-                    // Note that we completely remove a local sink to write to in case
-                    // our printing recursively panics/prints, so the recursive
-                    // panic/print goes to the global sink instead of our local sink.
-                    let prev = s.borrow_mut().take();
-                    if let Some(mut w) = prev {
-                        let result = w.write_fmt(args);
-                        *s.borrow_mut() = Some(w);
-                        return result;
-                    }
-                    global_s().write_fmt(args)
-                })
-                .ok()
-        })
-        .flatten()
-        .unwrap_or_else(|| global_s().write_fmt(args));
+    if print_to_buffer_if_capture_used(args) {
+        // Successfully wrote to capture buffer.
+        return;
+    }
 
-    if let Err(e) = result {
-        panic!("failed printing to {}: {}", label, e);
+    if let Err(e) = global_s().write_fmt(args) {
+        panic!("failed printing to {label}: {e}");
     }
 }
+
+fn print_to_buffer_if_capture_used(args: fmt::Arguments<'_>) -> bool {
+    OUTPUT_CAPTURE_USED.load(Ordering::Relaxed)
+        && OUTPUT_CAPTURE.try_with(|s| {
+            // Note that we completely remove a local sink to write to in case
+            // our printing recursively panics/prints, so the recursive
+            // panic/print goes to the global sink instead of our local sink.
+            s.take().map(|w| {
+                let _ = w.lock().unwrap_or_else(|e| e.into_inner()).write_fmt(args);
+                s.set(Some(w));
+            })
+        }) == Ok(Some(()))
+}
+
+/// Used by impl Termination for Result to print error after `main` or a test
+/// has returned. Should avoid panicking, although we can't help it if one of
+/// the Display impls inside args decides to.
+pub(crate) fn attempt_print_to_stderr(args: fmt::Arguments<'_>) {
+    if print_to_buffer_if_capture_used(args) {
+        return;
+    }
+
+    // Ignore error if the write fails, for example because stderr is already
+    // closed. There is not much point panicking at this point.
+    let _ = stderr().write_fmt(args);
+}
+
+/// Trait to determine if a descriptor/handle refers to a terminal/tty.
+#[stable(feature = "is_terminal", since = "1.70.0")]
+pub trait IsTerminal: crate::sealed::Sealed {
+    /// Returns `true` if the descriptor/handle refers to a terminal/tty.
+    ///
+    /// On platforms where Rust does not know how to detect a terminal yet, this will return
+    /// `false`. This will also return `false` if an unexpected error occurred, such as from
+    /// passing an invalid file descriptor.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// On Windows, in addition to detecting consoles, this currently uses some heuristics to
+    /// detect older msys/cygwin/mingw pseudo-terminals based on device name: devices with names
+    /// starting with `msys-` or `cygwin-` and ending in `-pty` will be considered terminals.
+    /// Note that this [may change in the future][changes].
+    ///
+    /// # Examples
+    ///
+    /// An example of a type for which `IsTerminal` is implemented is [`Stdin`]:
+    ///
+    /// ```no_run
+    /// use std::io::{self, IsTerminal, Write};
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let stdin = io::stdin();
+    ///
+    ///     // Indicate that the user is prompted for input, if this is a terminal.
+    ///     if stdin.is_terminal() {
+    ///         print!("> ");
+    ///         io::stdout().flush()?;
+    ///     }
+    ///
+    ///     let mut name = String::new();
+    ///     let _ = stdin.read_line(&mut name)?;
+    ///
+    ///     println!("Hello {}", name.trim_end());
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// The example can be run in two ways:
+    ///
+    /// - If you run this example by piping some text to it, e.g. `echo "foo" | path/to/executable`
+    ///   it will print: `Hello foo`.
+    /// - If you instead run the example interactively by running `path/to/executable` directly, it will
+    ///   prompt for input.
+    ///
+    /// [changes]: io#platform-specific-behavior
+    /// [`Stdin`]: crate::io::Stdin
+    #[doc(alias = "isatty")]
+    #[stable(feature = "is_terminal", since = "1.70.0")]
+    fn is_terminal(&self) -> bool;
+}
+
+macro_rules! impl_is_terminal {
+    ($($t:ty),*$(,)?) => {$(
+        #[unstable(feature = "sealed", issue = "none")]
+        impl crate::sealed::Sealed for $t {}
+
+        #[stable(feature = "is_terminal", since = "1.70.0")]
+        impl IsTerminal for $t {
+            #[inline]
+            fn is_terminal(&self) -> bool {
+                crate::sys::io::is_terminal(self)
+            }
+        }
+    )*}
+}
+
+impl_is_terminal!(File, Stdin, StdinLock<'_>, Stdout, StdoutLock<'_>, Stderr, StderrLock<'_>);
 
 #[unstable(
     feature = "print_internals",
@@ -1002,7 +1272,7 @@ fn print_to<T>(
 #[doc(hidden)]
 #[cfg(not(test))]
 pub fn _print(args: fmt::Arguments<'_>) {
-    print_to(args, &LOCAL_STDOUT, stdout, "stdout");
+    print_to(args, stdout, "stdout");
 }
 
 #[unstable(
@@ -1013,7 +1283,7 @@ pub fn _print(args: fmt::Arguments<'_>) {
 #[doc(hidden)]
 #[cfg(not(test))]
 pub fn _eprint(args: fmt::Arguments<'_>) {
-    print_to(args, &LOCAL_STDERR, stderr, "stderr");
+    print_to(args, stderr, "stderr");
 }
 
 #[cfg(test)]

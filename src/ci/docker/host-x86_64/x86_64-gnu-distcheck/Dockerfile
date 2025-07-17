@@ -1,5 +1,18 @@
-FROM ubuntu:16.04
+# Runs `distcheck`, which is a collection of smoke tests:
+# 
+# - Run `make check` from an unpacked dist tarball to make sure we can at the
+#   minimum run check steps from those sources.
+# - Check that selected dist components at least have expected directory shape
+#   and crate manifests that cargo can generate a lockfile from.
+#
+# Refer to `src/bootstrap/src/core/build_steps/test.rs` `Distcheck::run` for
+# specifics.
+#
+# FIXME(#136822): dist components are generally under-tested.
 
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
   g++ \
   make \
@@ -14,18 +27,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   gdb \
   xz-utils \
   libssl-dev \
-  pkg-config
+  pkg-config \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
 
-ENV RUST_CONFIGURE_ARGS --build=x86_64-unknown-linux-gnu --set rust.ignore-git=false
+# We are disabling CI LLVM since distcheck is an offline build.
+ENV NO_DOWNLOAD_CI_LLVM 1
+
+ENV RUST_CONFIGURE_ARGS --build=x86_64-unknown-linux-gnu --set rust.omit-git-hash=false
 ENV SCRIPT python3 ../x.py --stage 2 test distcheck
 ENV DIST_SRC 1
-
-# The purpose of this builder is to test that we can `./x.py --stage 2 test` successfully
-# from a tarball, not to test LLVM/rustc's own set of assertions. These cause a
-# significant hit to CI compile time (over a half hour as observed in #61185),
-# so disable assertions for this builder.
-ENV NO_LLVM_ASSERTIONS=1
-ENV NO_DEBUG_ASSERTIONS=1

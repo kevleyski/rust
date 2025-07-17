@@ -1,11 +1,9 @@
-use super::write::CodegenContext;
-use crate::traits::*;
-use crate::ModuleCodegen;
-
-use rustc_errors::FatalError;
-
 use std::ffi::CString;
 use std::sync::Arc;
+
+use rustc_data_structures::memmap::Mmap;
+
+use crate::traits::*;
 
 pub struct ThinModule<B: WriteBackendMethods> {
     pub shared: Arc<ThinShared<B>>,
@@ -39,61 +37,10 @@ pub struct ThinShared<B: WriteBackendMethods> {
     pub module_names: Vec<CString>,
 }
 
-pub enum LtoModuleCodegen<B: WriteBackendMethods> {
-    Fat {
-        module: Option<ModuleCodegen<B::Module>>,
-        _serialized_bitcode: Vec<SerializedModule<B::ModuleBuffer>>,
-    },
-
-    Thin(ThinModule<B>),
-}
-
-impl<B: WriteBackendMethods> LtoModuleCodegen<B> {
-    pub fn name(&self) -> &str {
-        match *self {
-            LtoModuleCodegen::Fat { .. } => "everything",
-            LtoModuleCodegen::Thin(ref m) => m.name(),
-        }
-    }
-
-    /// Optimize this module within the given codegen context.
-    ///
-    /// This function is unsafe as it'll return a `ModuleCodegen` still
-    /// points to LLVM data structures owned by this `LtoModuleCodegen`.
-    /// It's intended that the module returned is immediately code generated and
-    /// dropped, and then this LTO module is dropped.
-    pub unsafe fn optimize(
-        &mut self,
-        cgcx: &CodegenContext<B>,
-    ) -> Result<ModuleCodegen<B::Module>, FatalError> {
-        match *self {
-            LtoModuleCodegen::Fat { ref mut module, .. } => {
-                let module = module.take().unwrap();
-                {
-                    let config = cgcx.config(module.kind);
-                    B::run_lto_pass_manager(cgcx, &module, config, false);
-                }
-                Ok(module)
-            }
-            LtoModuleCodegen::Thin(ref mut thin) => B::optimize_thin(cgcx, thin),
-        }
-    }
-
-    /// A "gauge" of how costly it is to optimize this module, used to sort
-    /// biggest modules first.
-    pub fn cost(&self) -> u64 {
-        match *self {
-            // Only one module with fat LTO, so the cost doesn't matter.
-            LtoModuleCodegen::Fat { .. } => 0,
-            LtoModuleCodegen::Thin(ref m) => m.cost(),
-        }
-    }
-}
-
 pub enum SerializedModule<M: ModuleBufferMethods> {
     Local(M),
     FromRlib(Vec<u8>),
-    FromUncompressedFile(memmap::Mmap),
+    FromUncompressedFile(Mmap),
 }
 
 impl<M: ModuleBufferMethods> SerializedModule<M> {

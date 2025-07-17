@@ -1,8 +1,5 @@
-// run-rustfix
-// edition:2018
-
-#![feature(async_closure)]
 #![warn(clippy::async_yields_async)]
+#![allow(clippy::redundant_async_block)]
 
 use core::future::Future;
 use core::pin::Pin;
@@ -41,9 +38,11 @@ fn main() {
             3
         }.await
     };
+    //~^^^^ async_yields_async
     let _i = async {
         CustomFutureType.await
     };
+    //~^^ async_yields_async
     let _i = async || {
         3
     };
@@ -52,10 +51,13 @@ fn main() {
             3
         }.await
     };
+    //~^^^^ async_yields_async
     let _k = async || {
         CustomFutureType.await
     };
+    //~^^ async_yields_async
     let _l = async || CustomFutureType.await;
+    //~^ async_yields_async
     let _m = async || {
         println!("I'm bored");
         // Some more stuff
@@ -63,6 +65,18 @@ fn main() {
         // Finally something to await
         CustomFutureType.await
     };
+    //~^^ async_yields_async
     let _n = async || custom_future_type_ctor();
     let _o = async || f();
+}
+
+#[rustfmt::skip]
+#[allow(dead_code)]
+fn check_expect_suppression() {
+    #[expect(clippy::async_yields_async)]
+    let _j = async || {
+        async {
+            3
+        }
+    };
 }
